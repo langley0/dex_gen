@@ -111,10 +111,16 @@ class OptimizationScene:
     object_geom_ids: tuple[int, ...]
     point_records: list[dict[str, Any]]
     point_body_ids: tuple[int, ...]
+    point_local_positions: np.ndarray
+    point_local_normals: np.ndarray
     actuator_specs: list[HandActuatorSpec]
     qpos_lower: np.ndarray
     qpos_upper: np.ndarray
     object_center: np.ndarray
+    object_geom_type: int | None
+    object_geom_size: np.ndarray | None
+    object_geom_pos: np.ndarray | None
+    object_geom_rot: np.ndarray | None
     initial_state: HandState
 
 
@@ -386,10 +392,36 @@ def build_optimization_scene(
     )
     if any(body_id < 0 for body_id in point_body_ids):
         raise ValueError("A hand point body name could not be resolved in the optimization scene.")
+    point_local_positions = np.asarray(
+        [np.asarray(point_record["local_pos"], dtype=float) for point_record in hand_point_records],
+        dtype=float,
+    )
+    point_local_normals = np.asarray(
+        [np.asarray(point_record["local_normal"], dtype=float) for point_record in hand_point_records],
+        dtype=float,
+    )
 
     actuator_specs = describe_hand_actuators(model)
     qpos_lower = np.array([spec.ctrl_min for spec in actuator_specs], dtype=float)
     qpos_upper = np.array([spec.ctrl_max for spec in actuator_specs], dtype=float)
+
+    object_geom_type: int | None = None
+    object_geom_size: np.ndarray | None = None
+    object_geom_pos: np.ndarray | None = None
+    object_geom_rot: np.ndarray | None = None
+    if len(object_geom_ids) == 1:
+        geom_id = object_geom_ids[0]
+        geom_type = int(model.geom_type[geom_id])
+        if geom_type in {
+            int(mujoco.mjtGeom.mjGEOM_CYLINDER),
+            int(mujoco.mjtGeom.mjGEOM_BOX),
+            int(mujoco.mjtGeom.mjGEOM_SPHERE),
+            int(mujoco.mjtGeom.mjGEOM_CAPSULE),
+        }:
+            object_geom_type = geom_type
+            object_geom_size = model.geom_size[geom_id].copy()
+            object_geom_pos = data.geom_xpos[geom_id].copy()
+            object_geom_rot = data.geom_xmat[geom_id].reshape(3, 3).copy()
 
     initial_state = _state_from_pose_sample(pose_sample)
     return OptimizationScene(
@@ -401,10 +433,16 @@ def build_optimization_scene(
         object_geom_ids=object_geom_ids,
         point_records=hand_point_records,
         point_body_ids=point_body_ids,
+        point_local_positions=point_local_positions,
+        point_local_normals=point_local_normals,
         actuator_specs=actuator_specs,
         qpos_lower=qpos_lower,
         qpos_upper=qpos_upper,
         object_center=data.xipos[object_body_id].copy(),
+        object_geom_type=object_geom_type,
+        object_geom_size=object_geom_size,
+        object_geom_pos=object_geom_pos,
+        object_geom_rot=object_geom_rot,
         initial_state=initial_state,
     )
 
@@ -468,6 +506,104 @@ def _path_blocked_by_hand(
         None,
     )
     return 0.0 <= float(ray_distance) < (path_length - PATH_BLOCK_RAY_EPS)
+
+
+def _batch_box_signed_distances(points_local: np.ndarray, half_extents: np.ndarray) -> np.ndarray:
+    q = np.abs(points_local) - half_extents[None, :]
+    outside = np.maximum(q, 0.0)
+    outside_distance = np.linalg.norm(outside, axis=1)
+    inside_distance = np.minimum(np.max(q, axis=1), 0.0)
+    return outside_distance + inside_distance
+
+
+def _batch_sphere_signed_distances(points_local: np.ndarray, radius: float) -> np.ndarray:
+    return np.linalg.norm(points_local, axis=1) - radius
+
+
+def _batch_capsule_signed_distances(points_local: np.ndarray, radius: float, half_length: float) -> np.ndarray:
+    segment_z = np.clip(points_local[:, 2], -half_length, half_length)
+    delta = points_local - np.stack(
+        [
+            np.zeros_like(segment_z),
+            np.zeros_like(segment_z),
+            segment_z,
+        ],
+        axis=1,
+    )
+    return np.linalg.norm(delta, axis=1) - radius
+
+
+def _batch_cylinder_signed_distances(points_local: np.ndarray, radius: float, half_height: float) -> np.ndarray:
+    radial = np.linalg.norm(points_local[:, :2], axis=1)
+    radial_delta = radial - radius
+    top_delta = points_local[:, 2] - half_height
+    bottom_delta = -half_height - points_local[:, 2]
+
+    outside = np.stack(
+        [
+            np.maximum(radial_delta, 0.0),
+            np.maximum(top_delta, 0.0),
+            np.maximum(bottom_delta, 0.0),
+        ],
+        axis=1,
+    )
+    signed = np.linalg.norm(outside, axis=1)
+    inside_mask = (radial_delta <= 0.0) & (top_delta <= 0.0) & (bottom_delta <= 0.0)
+    if np.any(inside_mask):
+        signed[inside_mask] = -np.minimum.reduce(
+            [
+                radius - radial[inside_mask],
+                half_height - points_local[inside_mask, 2],
+                half_height + points_local[inside_mask, 2],
+            ]
+        )
+    return signed
+
+
+def _distance_only_contact_metrics_fast(
+    scene: OptimizationScene,
+    contact_indices: tuple[int, ...],
+) -> tuple[np.ndarray, bool] | None:
+    if (
+        scene.object_geom_type is None
+        or scene.object_geom_size is None
+        or scene.object_geom_pos is None
+        or scene.object_geom_rot is None
+    ):
+        return None
+    if len(contact_indices) == 0:
+        return np.zeros(0, dtype=float), False
+
+    contact_index_array = np.asarray(contact_indices, dtype=np.intp)
+    body_index_array = np.asarray(scene.point_body_ids, dtype=np.intp)[contact_index_array]
+    body_positions = scene.data.xpos[body_index_array]
+    body_rotations = scene.data.xmat[body_index_array].reshape(-1, 3, 3)
+    local_positions = scene.point_local_positions[contact_index_array]
+    world_positions = body_positions + np.einsum("nij,nj->ni", body_rotations, local_positions)
+    points_local = (world_positions - scene.object_geom_pos[None, :]) @ scene.object_geom_rot
+
+    geom_type = scene.object_geom_type
+    geom_size = scene.object_geom_size
+    if geom_type == int(mujoco.mjtGeom.mjGEOM_CYLINDER):
+        signed_distances = _batch_cylinder_signed_distances(
+            points_local,
+            radius=float(geom_size[0]),
+            half_height=float(geom_size[1]),
+        )
+    elif geom_type == int(mujoco.mjtGeom.mjGEOM_BOX):
+        signed_distances = _batch_box_signed_distances(points_local, geom_size[:3])
+    elif geom_type == int(mujoco.mjtGeom.mjGEOM_SPHERE):
+        signed_distances = _batch_sphere_signed_distances(points_local, radius=float(geom_size[0]))
+    elif geom_type == int(mujoco.mjtGeom.mjGEOM_CAPSULE):
+        signed_distances = _batch_capsule_signed_distances(
+            points_local,
+            radius=float(geom_size[0]),
+            half_length=float(geom_size[1]),
+        )
+    else:
+        return None
+
+    return np.abs(signed_distances), bool(np.any(signed_distances < 0.0))
 
 
 def _current_contact_probes(
@@ -565,6 +701,28 @@ def calculate_energy(
 ) -> tuple[GeneMetrics, list[HandPointProbe]]:
     projected_state = _project_state(scene, state, config)
     _apply_state(scene, projected_state)
+
+    if not include_contacts:
+        fast_result = _distance_only_contact_metrics_fast(scene, contact_indices)
+        if fast_result is not None:
+            distances, selected_penetration = fast_result
+            e_dis = float(np.sum(distances))
+            score = float(config.loss.distance_weight * e_dis)
+            metrics = GeneMetrics(
+                point_indices=contact_indices,
+                score=score,
+                e_dis=e_dis,
+                e_tq=0.0,
+                e_pen=0.0,
+                e_qpos=0.0,
+                e_force=0.0,
+                scene_penetration_depth=0.0,
+                selected_penetration=bool(selected_penetration),
+                selected_path_blocked_count=0,
+                e_align=0.0,
+                e_palm=0.0,
+            )
+            return metrics, []
 
     object_center = scene.data.xipos[scene.object_body_id].copy()
     object_body_pos = scene.data.xpos[scene.object_body_id].copy()
@@ -1159,10 +1317,16 @@ def build_best_candidate_snapshot(
         ),
         point_records=[],
         point_body_ids=(),
+        point_local_positions=np.zeros((0, 3), dtype=float),
+        point_local_normals=np.zeros((0, 3), dtype=float),
         actuator_specs=describe_hand_actuators(model),
         qpos_lower=model.actuator_ctrlrange[:, 0].copy(),
         qpos_upper=model.actuator_ctrlrange[:, 1].copy(),
         object_center=np.zeros(3, dtype=float),
+        object_geom_type=None,
+        object_geom_size=None,
+        object_geom_pos=None,
+        object_geom_rot=None,
         initial_state=HandState(
             root_pos=np.asarray(candidate["hand_root_pos"], dtype=float),
             root_quat=np.asarray(candidate["hand_root_quat"], dtype=float),
