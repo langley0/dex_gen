@@ -1,0 +1,15 @@
+<mujoco model="scene_grasp_view">
+  <include file="/mnt/d/work/mujoco-study/bodex_mjx/assets/inspire/tmp9xac2b63.xml"/>
+  <include file="/mnt/d/work/mujoco-study/bodex_mjx/assets/drill/tmpzlsv_30z.xml"/>
+  <visual>
+    <headlight diffuse="0.7 0.7 0.7" ambient="0.3 0.3 0.3" specular="0.1 0.1 0.1"/>
+  </visual>
+  <worldbody>
+    <geom name="support_plane" type="plane" pos="0.0 0.0 0.0" zaxis="0.0 0.0 1.0" size="0.8 0.8 0.04" rgba="0.93 0.93 0.93 1"/>
+    <site name="anchor_marker" type="sphere" size="0.006" pos="0.01748587004840374 -0.09126779437065125 0.04893851652741432" rgba="1 0.2 0.2 1"/>
+    <site name="pregrasp_marker" type="sphere" size="0.006" pos="0.02816554345190525 -0.13282106816768646 0.22687457501888275" rgba="0.2 0.4 1 1"/>
+    <site name="grasp_marker" type="sphere" size="0.006" pos="0.02641887031495571 -0.10359955579042435 0.20531311631202698" rgba="0.2 1 0.4 1"/>
+    <site name="approach_dir" type="capsule" size="0.003" fromto="0.01748587004840374 -0.09126779437065125 0.04893851652741432 0.013992521911859512 -0.03282478079199791 0.03581560403108597" rgba="0.2 0.7 1 1"/>
+    <site name="arm_back_dir" type="capsule" size="0.003" fromto="0.02641887031495571 -0.10359955579042435 0.20531311631202698 0.03165889158844948 -0.1912640929222107 0.22499749064445496" rgba="1 0.7 0.1 1"/>
+  </worldbody>
+</mujoco>

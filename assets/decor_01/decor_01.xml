@@ -1,0 +1,15 @@
+<?xml version="1.0" ?>
+<mujoco model="decor_01">
+  <compiler angle="radian" meshdir="meshes"/>
+  <asset>
+    <mesh name="decor_01_visual" file="decor_01_visual.obj"/>
+    <mesh name="decor_01_collision" file="decor_01_collision.stl"/>
+  </asset>
+  <worldbody>
+    <body name="base_link" pos="0 0 0">
+      <inertial pos="-0.000168 0.007775 -0.003293" mass="0.085680" fullinertia="3.292366e-04 1.981565e-04 1.594471e-04 -2.281532e-07 -2.671221e-07 -6.803542e-07"/>
+      <geom name="visual" type="mesh" mesh="decor_01_visual" contype="0" conaffinity="0" group="2"/>
+      <geom name="collision" type="mesh" mesh="decor_01_collision" contype="1" conaffinity="1" group="3"/>
+    </body>
+  </worldbody>
+</mujoco>

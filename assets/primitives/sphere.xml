@@ -1,0 +1,15 @@
+<mujoco model="sphere">
+  <worldbody>
+    <body name="grasp_object" pos="0 0 0" quat="1 0 0 0">
+      <freejoint name="grasp_object_freejoint"/>
+      <geom
+        name="grasp_object_geom"
+        type="sphere"
+        size="0.03"
+        density="400"
+        friction="0.25 0.02 0.002"
+        rgba="0.85 0.45 0.2 1"/>
+      <site name="grasp_anchor" pos="0 0 0" size="0.004" rgba="1 0.2 0.2 1"/>
+    </body>
+  </worldbody>
+</mujoco>

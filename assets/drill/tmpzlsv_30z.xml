@@ -1,0 +1,16 @@
+<mujoco model="material">
+  <compiler angle="radian" />
+  <asset>
+    <texture name="material_base_color" type="2d" file="/mnt/d/work/mujoco-study/bodex_mjx/assets/drill/meshes/texture_pbr_20250901.png" />
+    <material name="material_mat" texture="material_base_color" texuniform="true" />
+    <mesh name="material_visual" file="/mnt/d/work/mujoco-study/bodex_mjx/assets/drill/meshes/material_visual.obj" />
+    <mesh name="material_collision" file="/mnt/d/work/mujoco-study/bodex_mjx/assets/drill/meshes/material_collision.stl" />
+  </asset>
+  <worldbody>
+    <body name="grasp_object" pos="0 0 0">
+      <freejoint name="grasp_object_freejoint" /><inertial pos="0.012024 -0.023863 0.001308" mass="0.643915" fullinertia="3.457934e-03 6.641876e-04 3.839510e-03 1.459862e-04 -1.764735e-06 1.481813e-06" />
+      <geom name="visual" type="mesh" mesh="material_visual" contype="0" conaffinity="0" group="2" material="material_mat" />
+      <geom name="grasp_object_geom" type="mesh" mesh="material_collision" contype="1" conaffinity="1" group="3" />
+    <site name="grasp_anchor" pos="0.0 0.0 0.0" size="0.004" rgba="1 0.2 0.2 1" /></body>
+  </worldbody>
+</mujoco>

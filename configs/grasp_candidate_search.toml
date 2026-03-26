@@ -1,0 +1,57 @@
+# Genetic contact-candidate search in a hand-only environment.
+
+[scene]
+hand = "right"
+hand_points_per_joint = 10
+object_body_name = "pickup_cylinder"
+object_geom_names = ["pickup_cylinder_geom"]
+
+[hand_pose]
+sample_count = 16
+surface_offset = 0.30
+surface_candidate_count = 64
+roll_search_steps = 72
+distance_std_weight = 0.75
+distance_max_weight = 0.25
+accessible_normal_min_z = -0.25
+thumb_contact_weight = 4.0
+
+[hand_init]
+flexion_min_rad = 0.1
+flexion_max_rad = 0.25
+thumb_pinch_rad = 1.5707963267948966
+thumb_non_yaw_zero = true
+
+[gene]
+contact_count = 4
+mutation_probability = 0.5
+force_at_least_one_mutation = true
+
+[search]
+random_seed = 7
+initial_gene_count = 48
+children_per_parent = 6
+min_generations = 6
+max_generations = 60
+plateau_window = 5
+plateau_tolerance = 5.0e-4
+max_population_size = 64
+candidate_limit = 20
+strict_improvement_margin = 1.0e-9
+
+[loss]
+distance_weight = 100.0
+torque_weight = 2.0
+penetration_weight = 1.0
+penetration_penalty_value = 1000000.0
+qpos_weight = 10.0
+qpos_edge_margin = 0.05
+qpos_excluded_joint_names = ["right_thumb_proximal_yaw_joint"]
+contact_alignment_weight = 10.0
+contact_alignment_min_dot = 0.2
+palm_alignment_weight = 4.0
+palm_alignment_min_dot = 0.1
+
+[output]
+candidate_json = "generated/grasp_candidates_right.json"
+snapshot = "generated/grasp_candidates_right.png"
