@@ -28,7 +28,8 @@ mutation_probability = 0.5
 force_at_least_one_mutation = true
 
 [search]
-random_seed = 7
+# Use an integer here for reproducible runs.
+random_seed = "auto"
 initial_gene_count = 48
 children_per_parent = 6
 min_generations = 6

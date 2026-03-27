@@ -66,16 +66,6 @@ def _configure_candidate_camera(cam: mujoco.MjvCamera, object_center: np.ndarray
     cam.elevation = -20.0
 
 
-def _initialize_static_state(model: mujoco.MjModel, data: mujoco.MjData) -> None:
-    data.qpos[:] = model.qpos0
-    data.qvel[:] = 0.0
-    if model.nu > 0:
-        zero_ctrl = np.zeros(model.nu, dtype=float)
-        ctrl_range = model.actuator_ctrlrange
-        data.ctrl[:] = np.clip(zero_ctrl, ctrl_range[:, 0], ctrl_range[:, 1])
-    mujoco.mj_forward(model, data)
-
-
 def _apply_hand_state(
     model: mujoco.MjModel,
     data: mujoco.MjData,

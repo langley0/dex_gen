@@ -29,7 +29,8 @@ contact_count = 4
 switch_possibility = 0.5
 
 [run]
-random_seed = 7
+# Use an integer here for reproducible runs.
+random_seed = "auto"
 candidate_limit = 20
 
 [optimize]

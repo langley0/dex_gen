@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import secrets
 import tomllib
 from collections import defaultdict
 from dataclasses import dataclass
@@ -234,6 +235,18 @@ def _path_from_config(root: Path, value: str | None) -> Path | None:
     return path
 
 
+def resolve_random_seed(raw_seed: Any, default: int | str = "auto") -> int:
+    seed_value = default if raw_seed is None else raw_seed
+    if isinstance(seed_value, str):
+        normalized = seed_value.strip().lower()
+        if normalized in {"auto", "random"}:
+            return secrets.randbits(64)
+    seed = int(seed_value)
+    if seed < 0:
+        raise ValueError("random_seed must be non-negative, or 'auto'.")
+    return seed
+
+
 def _angle_to_rad(raw: dict[str, Any], rad_key: str, deg_key: str) -> float:
     if rad_key in raw:
         return float(raw[rad_key])
@@ -284,24 +297,6 @@ def _rotation_matrix_to_quaternion(rotation: np.ndarray) -> np.ndarray:
     return _normalize(np.array([w, x, y, z], dtype=float))
 
 
-def _make_orthonormal_basis_from_x(x_axis: np.ndarray, roll_rad: float) -> np.ndarray:
-    x_axis = _normalize(x_axis)
-    helper = np.array([0.0, 0.0, 1.0], dtype=float)
-    if abs(np.dot(helper, x_axis)) > 0.95:
-        helper = np.array([0.0, 1.0, 0.0], dtype=float)
-
-    y_axis = helper - np.dot(helper, x_axis) * x_axis
-    y_axis = _normalize(y_axis)
-    z_axis = _normalize(np.cross(x_axis, y_axis))
-    y_axis = _normalize(np.cross(z_axis, x_axis))
-
-    cos_r = float(np.cos(roll_rad))
-    sin_r = float(np.sin(roll_rad))
-    rolled_y = cos_r * y_axis + sin_r * z_axis
-    rolled_z = -sin_r * y_axis + cos_r * z_axis
-    return np.column_stack([x_axis, rolled_y, rolled_z])
-
-
 def load_optimizer_config(config_path: Path) -> OptimizerConfig:
     with config_path.open("rb") as f:
         raw = tomllib.load(f)
@@ -337,7 +332,7 @@ def load_optimizer_config(config_path: Path) -> OptimizerConfig:
         force_at_least_one_mutation=bool(gene_raw["force_at_least_one_mutation"]),
     )
     search = SearchConfig(
-        random_seed=int(search_raw["random_seed"]),
+        random_seed=resolve_random_seed(search_raw.get("random_seed", "auto")),
         initial_gene_count=int(search_raw["initial_gene_count"]),
         children_per_parent=int(search_raw["children_per_parent"]),
         min_generations=int(search_raw["min_generations"]),
@@ -1584,10 +1579,6 @@ def build_best_candidate_snapshot(
     renderer.update_scene(data, camera=camera)
     Image.fromarray(renderer.render()).save(output_path)
     renderer.close()
-
-
-def format_contact_label(probe: HandPointProbe) -> str:
-    return f"{probe.point_index}:{probe.finger}_{probe.role}"
 
 
 def print_candidate_summary(candidates: list[dict[str, Any]], top_n: int) -> None:

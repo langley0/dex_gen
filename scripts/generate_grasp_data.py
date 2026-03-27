@@ -37,6 +37,7 @@ from generate_grasp_candidates import (
     describe_hand_actuators,
     parse_hand_init_config,
     parse_qpos_excluded_joint_names,
+    resolve_random_seed,
     sample_initial_pose_sequence,
 )
 from view_surface_points import HAND_ROLE_COLORS, SEGMENT_SPECS, compute_finger_surface_point_records
@@ -189,7 +190,7 @@ def load_optimizer_config(config_path: Path) -> OptimizerConfig:
         switch_possibility=float(contacts_raw.get("switch_possibility", contacts_raw.get("mutation_probability", 0.5))),
     )
     run = RunConfig(
-        random_seed=int(run_raw.get("random_seed", 7)),
+        random_seed=resolve_random_seed(run_raw.get("random_seed", "auto")),
         candidate_limit=int(run_raw.get("candidate_limit", output_raw.get("candidate_limit", hand_pose.sample_count))),
     )
     optimize = OptimizeConfig(
@@ -1392,10 +1393,6 @@ class AnnealingRMSPropOptimizer:
             )
         return accepted
 
-    def asset_step(self, proposed_metrics: GeneMetrics) -> bool:
-        return self.assess_step(proposed_metrics)
-
-
 def build_pose_search_results(
     config: OptimizerConfig,
 ) -> tuple[list[PoseSearchResult], list[dict[str, Any]]]:
@@ -1552,18 +1549,6 @@ def build_pose_search_results(
         )
 
     return pose_results, candidate_records
-
-
-def _reference_hand_model(side: str) -> mujoco.MjModel:
-    from view_franka_inspire import _load_hand_spec
-
-    return _load_hand_spec(side).compile()
-
-
-def _reference_pose_transform(side: str) -> tuple[np.ndarray, np.ndarray]:
-    from generate_grasp_candidates import _reference_root_to_palm_transform
-
-    return _reference_root_to_palm_transform(side)
 
 
 def save_candidate_json(
