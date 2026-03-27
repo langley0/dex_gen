@@ -900,31 +900,15 @@ def _batch_capsule_signed_distances(points_local: np.ndarray, radius: float, hal
 
 
 def _batch_cylinder_signed_distances(points_local: np.ndarray, radius: float, half_height: float) -> np.ndarray:
-    radial = np.linalg.norm(points_local[..., :2], axis=-1)
+    # Equivalent capped-cylinder SDF, written without stacking temporary tensors.
+    radial = np.sqrt(points_local[..., 0] * points_local[..., 0] + points_local[..., 1] * points_local[..., 1])
     radial_delta = radial - radius
-    top_delta = points_local[..., 2] - half_height
-    bottom_delta = -half_height - points_local[..., 2]
-
-    outside = np.stack(
-        [
-            np.maximum(radial_delta, 0.0),
-            np.maximum(top_delta, 0.0),
-            np.maximum(bottom_delta, 0.0),
-        ],
-        axis=-1,
-    )
-    signed = np.linalg.norm(outside, axis=-1)
-    inside_mask = (radial_delta <= 0.0) & (top_delta <= 0.0) & (bottom_delta <= 0.0)
-    if np.any(inside_mask):
-        signed = np.array(signed, copy=True)
-        signed[inside_mask] = -np.minimum.reduce(
-            [
-                radius - radial[inside_mask],
-                half_height - points_local[..., 2][inside_mask],
-                half_height + points_local[..., 2][inside_mask],
-            ]
-        )
-    return signed
+    height_delta = np.abs(points_local[..., 2]) - half_height
+    outside_radial = np.maximum(radial_delta, 0.0)
+    outside_height = np.maximum(height_delta, 0.0)
+    outside_distance = np.sqrt(outside_radial * outside_radial + outside_height * outside_height)
+    inside_distance = np.minimum(np.maximum(radial_delta, height_delta), 0.0)
+    return outside_distance + inside_distance
 
 
 def _distance_only_contact_metrics_fast(
