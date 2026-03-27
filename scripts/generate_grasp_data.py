@@ -875,35 +875,35 @@ def _path_blocked_by_hand(
 
 
 def _batch_box_signed_distances(points_local: np.ndarray, half_extents: np.ndarray) -> np.ndarray:
-    q = np.abs(points_local) - half_extents[None, :]
+    q = np.abs(points_local) - half_extents
     outside = np.maximum(q, 0.0)
-    outside_distance = np.linalg.norm(outside, axis=1)
-    inside_distance = np.minimum(np.max(q, axis=1), 0.0)
+    outside_distance = np.linalg.norm(outside, axis=-1)
+    inside_distance = np.minimum(np.max(q, axis=-1), 0.0)
     return outside_distance + inside_distance
 
 
 def _batch_sphere_signed_distances(points_local: np.ndarray, radius: float) -> np.ndarray:
-    return np.linalg.norm(points_local, axis=1) - radius
+    return np.linalg.norm(points_local, axis=-1) - radius
 
 
 def _batch_capsule_signed_distances(points_local: np.ndarray, radius: float, half_length: float) -> np.ndarray:
-    segment_z = np.clip(points_local[:, 2], -half_length, half_length)
+    segment_z = np.clip(points_local[..., 2], -half_length, half_length)
     delta = points_local - np.stack(
         [
             np.zeros_like(segment_z),
             np.zeros_like(segment_z),
             segment_z,
         ],
-        axis=1,
+        axis=-1,
     )
-    return np.linalg.norm(delta, axis=1) - radius
+    return np.linalg.norm(delta, axis=-1) - radius
 
 
 def _batch_cylinder_signed_distances(points_local: np.ndarray, radius: float, half_height: float) -> np.ndarray:
-    radial = np.linalg.norm(points_local[:, :2], axis=1)
+    radial = np.linalg.norm(points_local[..., :2], axis=-1)
     radial_delta = radial - radius
-    top_delta = points_local[:, 2] - half_height
-    bottom_delta = -half_height - points_local[:, 2]
+    top_delta = points_local[..., 2] - half_height
+    bottom_delta = -half_height - points_local[..., 2]
 
     outside = np.stack(
         [
@@ -911,16 +911,17 @@ def _batch_cylinder_signed_distances(points_local: np.ndarray, radius: float, ha
             np.maximum(top_delta, 0.0),
             np.maximum(bottom_delta, 0.0),
         ],
-        axis=1,
+        axis=-1,
     )
-    signed = np.linalg.norm(outside, axis=1)
+    signed = np.linalg.norm(outside, axis=-1)
     inside_mask = (radial_delta <= 0.0) & (top_delta <= 0.0) & (bottom_delta <= 0.0)
     if np.any(inside_mask):
+        signed = np.array(signed, copy=True)
         signed[inside_mask] = -np.minimum.reduce(
             [
                 radius - radial[inside_mask],
-                half_height - points_local[inside_mask, 2],
-                half_height + points_local[inside_mask, 2],
+                half_height - points_local[..., 2][inside_mask],
+                half_height + points_local[..., 2][inside_mask],
             ]
         )
     return signed
@@ -1100,6 +1101,96 @@ def calculate_energy(
     return metrics, contacts
 
 
+def _score_projected_states_batch(
+    scene: OptimizationScene,
+    contact_indices: tuple[int, ...],
+    projected_states: list[HandState],
+    config: OptimizerConfig,
+) -> np.ndarray:
+    state_count = len(projected_states)
+    if state_count == 0:
+        return np.zeros(0, dtype=float)
+
+    if (
+        scene.object_geom_type is None
+        or scene.object_geom_size is None
+        or scene.object_geom_pos is None
+        or scene.object_geom_rot is None
+    ):
+        scores = np.empty(state_count, dtype=float)
+        for state_index, trial_state in enumerate(projected_states):
+            trial_metrics, _ = calculate_energy(
+                scene,
+                contact_indices,
+                trial_state,
+                config,
+                include_contacts=False,
+            )
+            scores[state_index] = float(trial_metrics.score)
+        return scores
+
+    contact_index_array = np.asarray(contact_indices, dtype=np.intp)
+    contact_count = int(len(contact_index_array))
+    contact_world_positions = np.zeros((state_count, contact_count, 3), dtype=float)
+
+    penetration_count = int(scene.penetration_local_positions.shape[0])
+    penetration_world_positions = np.zeros((state_count, penetration_count, 3), dtype=float)
+
+    if contact_count > 0:
+        contact_body_indices = scene.point_body_index_array[contact_index_array]
+        contact_local_positions = scene.point_local_positions[contact_index_array]
+    else:
+        contact_body_indices = np.zeros(0, dtype=np.intp)
+        contact_local_positions = np.zeros((0, 3), dtype=float)
+
+    for state_index, trial_state in enumerate(projected_states):
+        _apply_state(scene, trial_state)
+        if contact_count > 0:
+            contact_world_positions[state_index] = _body_local_points_to_world(
+                scene,
+                contact_body_indices,
+                contact_local_positions,
+            )
+        if penetration_count > 0:
+            penetration_world_positions[state_index] = _body_local_points_to_world(
+                scene,
+                scene.penetration_body_index_array,
+                scene.penetration_local_positions,
+            )
+
+    scores = np.zeros(state_count, dtype=float)
+    if contact_count > 0:
+        contact_signed_distances = _batch_object_signed_distances(scene, contact_world_positions)
+        if contact_signed_distances is None:
+            return np.array(
+                [
+                    calculate_energy(scene, contact_indices, trial_state, config, include_contacts=False)[0].score
+                    for trial_state in projected_states
+                ],
+                dtype=float,
+            )
+        scores += config.loss.distance_weight * np.sum(np.abs(contact_signed_distances), axis=1)
+
+    if penetration_count > 0 and config.loss.penetration_weight != 0.0:
+        penetration_signed_distances = _batch_object_signed_distances(scene, penetration_world_positions)
+        if penetration_signed_distances is None:
+            return np.array(
+                [
+                    calculate_energy(scene, contact_indices, trial_state, config, include_contacts=False)[0].score
+                    for trial_state in projected_states
+                ],
+                dtype=float,
+            )
+        penetration_depths = np.maximum(-(penetration_signed_distances + PENETRATION_SURFACE_EPS), 0.0)
+        scores += config.loss.penetration_weight * np.sum(
+            scene.penetration_area_weights[None, :] * penetration_depths,
+            axis=1,
+        )
+
+    _apply_state(scene, projected_states[-1])
+    return scores
+
+
 def _state_trace_entry(
     step: int,
     state: HandState,
@@ -1149,6 +1240,9 @@ def finite_difference_gradient(
     base_vector = _pack_state(state)
     epsilons = _state_epsilons(scene, config)
     gradient = np.zeros_like(base_vector)
+    valid_dim_indices: list[int] = []
+    actual_deltas: list[float] = []
+    projected_trial_states: list[HandState] = []
 
     for dim_index, epsilon in enumerate(epsilons):
         trial_vector = base_vector.copy()
@@ -1158,14 +1252,23 @@ def finite_difference_gradient(
         actual_delta = projected_vector[dim_index] - base_vector[dim_index]
         if abs(actual_delta) < 1e-9:
             continue
-        trial_metrics, _ = calculate_energy(
-            scene,
-            contact_indices,
-            trial_state,
-            config,
-            include_contacts=False,
-        )
-        gradient[dim_index] = (trial_metrics.score - base_score) / actual_delta
+        valid_dim_indices.append(dim_index)
+        actual_deltas.append(float(actual_delta))
+        projected_trial_states.append(trial_state)
+
+    trial_scores = _score_projected_states_batch(
+        scene,
+        contact_indices,
+        projected_trial_states,
+        config,
+    )
+    for dim_index, actual_delta, trial_score in zip(
+        valid_dim_indices,
+        actual_deltas,
+        trial_scores,
+        strict=True,
+    ):
+        gradient[dim_index] = (float(trial_score) - base_score) / actual_delta
 
     grad_norm = float(np.linalg.norm(gradient))
     if grad_norm > config.optimize.gradient_clip:
