@@ -349,7 +349,8 @@ def _apply_state(scene: OptimizationScene, state: HandState) -> None:
     scene.data.qvel[:] = 0.0
     if scene.model.nu > 0:
         scene.data.ctrl[:] = np.clip(state.hand_ctrl, scene.qpos_lower, scene.qpos_upper)
-    mujoco.mj_forward(scene.model, scene.data)
+    mujoco.mj_kinematics(scene.model, scene.data)
+    mujoco.mj_comPos(scene.model, scene.data)
 
 
 def build_optimization_scene(
