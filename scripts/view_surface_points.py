@@ -58,6 +58,12 @@ def _normalize(vec: np.ndarray) -> np.ndarray:
     return vec / norm
 
 
+def _quat_to_matrix(quat: np.ndarray) -> np.ndarray:
+    matrix = np.zeros(9, dtype=float)
+    mujoco.mju_quat2Mat(matrix, np.asarray(quat, dtype=float))
+    return matrix.reshape(3, 3)
+
+
 def _capsule_strip_area(radius: float, half_length: float, half_angle: float) -> float:
     return radius * (2.0 * half_angle) * (2.0 * half_length)
 
@@ -194,6 +200,175 @@ def _farthest_point_sample(points: np.ndarray, target_count: int) -> np.ndarray:
         min_distance_sq[selected_indices[: selected_count + 1]] = -np.inf
 
     return points[selected_indices]
+
+
+def _farthest_point_sample_indices(points: np.ndarray, target_count: int) -> np.ndarray:
+    if target_count <= 0 or len(points) == 0:
+        return np.zeros(0, dtype=int)
+    if len(points) <= target_count:
+        return np.arange(len(points), dtype=int)
+
+    selected_indices = np.empty(target_count, dtype=int)
+    centroid = np.mean(points, axis=0)
+    start_index = int(np.argmin(np.sum((points - centroid) ** 2, axis=1)))
+    selected_indices[0] = start_index
+
+    min_distance_sq = np.sum((points - points[start_index]) ** 2, axis=1)
+    min_distance_sq[start_index] = -np.inf
+
+    for selected_count in range(1, target_count):
+        next_index = int(np.argmax(min_distance_sq))
+        selected_indices[selected_count] = next_index
+        distance_sq = np.sum((points - points[next_index]) ** 2, axis=1)
+        min_distance_sq = np.minimum(min_distance_sq, distance_sq)
+        min_distance_sq[selected_indices[: selected_count + 1]] = -np.inf
+
+    return selected_indices
+
+
+def _unique_mesh_geom_ids_for_body(model: mujoco.MjModel, body_id: int) -> list[int]:
+    geom_ids: list[int] = []
+    seen_mesh_ids: set[int] = set()
+    for geom_id in range(model.ngeom):
+        if int(model.geom_bodyid[geom_id]) != int(body_id):
+            continue
+        if int(model.geom_type[geom_id]) != int(mujoco.mjtGeom.mjGEOM_MESH):
+            continue
+        mesh_id = int(model.geom_dataid[geom_id])
+        if mesh_id < 0 or mesh_id in seen_mesh_ids:
+            continue
+        seen_mesh_ids.add(mesh_id)
+        geom_ids.append(geom_id)
+    return geom_ids
+
+
+def _mesh_triangle_data_body_local(
+    model: mujoco.MjModel,
+    geom_id: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    mesh_id = int(model.geom_dataid[geom_id])
+    vertadr = int(model.mesh_vertadr[mesh_id])
+    vertnum = int(model.mesh_vertnum[mesh_id])
+    faceadr = int(model.mesh_faceadr[mesh_id])
+    facenum = int(model.mesh_facenum[mesh_id])
+
+    vertices = model.mesh_vert[vertadr : vertadr + vertnum].copy()
+    vertices *= model.geom_size[geom_id][None, :]
+    geom_rot = _quat_to_matrix(model.geom_quat[geom_id])
+    geom_pos = model.geom_pos[geom_id].copy()
+    vertices_body_local = geom_pos[None, :] + vertices @ geom_rot.T
+
+    faces = model.mesh_face[faceadr : faceadr + facenum]
+    triangles = vertices_body_local[faces]
+    edge_1 = triangles[:, 1] - triangles[:, 0]
+    edge_2 = triangles[:, 2] - triangles[:, 0]
+    triangle_normals = np.cross(edge_1, edge_2)
+    triangle_norms = np.linalg.norm(triangle_normals, axis=1)
+    valid = triangle_norms > 1.0e-12
+    if not np.any(valid):
+        return (
+            np.zeros((0, 3, 3), dtype=float),
+            np.zeros((0, 3), dtype=float),
+            np.zeros(0, dtype=float),
+        )
+
+    triangles = triangles[valid]
+    triangle_normals = triangle_normals[valid] / triangle_norms[valid, None]
+    triangle_areas = 0.5 * triangle_norms[valid]
+    return triangles, triangle_normals, triangle_areas
+
+
+def _sample_triangle_points_world(
+    rng: np.random.Generator,
+    triangles_world: np.ndarray,
+    triangle_normals_world: np.ndarray,
+    triangle_areas: np.ndarray,
+    point_count: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if point_count <= 0 or len(triangles_world) == 0:
+        return np.zeros((0, 3), dtype=float), np.zeros((0, 3), dtype=float)
+
+    probabilities = triangle_areas / float(np.sum(triangle_areas))
+    triangle_indices = rng.choice(len(triangles_world), size=point_count, p=probabilities)
+    selected_triangles = triangles_world[triangle_indices]
+    selected_normals = triangle_normals_world[triangle_indices]
+
+    uv = rng.uniform(size=(point_count, 2))
+    sqrt_u = np.sqrt(uv[:, 0])
+    barycentric = np.stack(
+        [
+            1.0 - sqrt_u,
+            sqrt_u * (1.0 - uv[:, 1]),
+            sqrt_u * uv[:, 1],
+        ],
+        axis=1,
+    )
+    world_points = np.einsum("ni,nij->nj", barycentric, selected_triangles)
+    return world_points, selected_normals
+
+
+def _sample_visual_segment_surface_world_points(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    body_id: int,
+    center: np.ndarray,
+    axis: np.ndarray,
+    palm_side: np.ndarray,
+    point_count: int,
+    excluded_axis_intervals: list[tuple[float, float]],
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    mesh_geom_ids = _unique_mesh_geom_ids_for_body(model, body_id)
+    if not mesh_geom_ids:
+        return np.zeros((0, 3), dtype=float), np.zeros((0, 3), dtype=float)
+
+    body_pos = data.xpos[body_id]
+    body_rot = data.xmat[body_id].reshape(3, 3)
+    min_normal_dot = float(np.cos(FLEXION_SURFACE_HALF_ANGLE))
+
+    triangles_world_parts: list[np.ndarray] = []
+    normals_world_parts: list[np.ndarray] = []
+    areas_parts: list[np.ndarray] = []
+    for geom_id in mesh_geom_ids:
+        triangles_local, triangle_normals_local, triangle_areas = _mesh_triangle_data_body_local(model, geom_id)
+        if len(triangles_local) == 0:
+            continue
+        triangles_world = body_pos[None, None, :] + np.einsum("ij,ntj->nti", body_rot, triangles_local)
+        normals_world = np.einsum("ij,nj->ni", body_rot, triangle_normals_local)
+        centroids_world = np.mean(triangles_world, axis=1)
+        axis_positions = np.einsum("nj,j->n", centroids_world - center[None, :], axis)
+        normal_dots = np.einsum("nj,j->n", normals_world, palm_side)
+        valid_mask = normal_dots >= min_normal_dot
+        if excluded_axis_intervals:
+            valid_mask &= np.array(
+                [_axis_position_allowed(float(axis_pos), excluded_axis_intervals) for axis_pos in axis_positions],
+                dtype=bool,
+            )
+        if not np.any(valid_mask):
+            continue
+        triangles_world_parts.append(triangles_world[valid_mask])
+        normals_world_parts.append(normals_world[valid_mask])
+        areas_parts.append(triangle_areas[valid_mask])
+
+    if not triangles_world_parts:
+        return np.zeros((0, 3), dtype=float), np.zeros((0, 3), dtype=float)
+
+    triangles_world = np.concatenate(triangles_world_parts, axis=0)
+    normals_world = np.concatenate(normals_world_parts, axis=0)
+    triangle_areas = np.concatenate(areas_parts, axis=0)
+    candidate_count = max(point_count * 24, point_count + 32, 256)
+    candidate_points, candidate_normals = _sample_triangle_points_world(
+        rng,
+        triangles_world=triangles_world,
+        triangle_normals_world=normals_world,
+        triangle_areas=triangle_areas,
+        point_count=candidate_count,
+    )
+    if len(candidate_points) < point_count:
+        return np.zeros((0, 3), dtype=float), np.zeros((0, 3), dtype=float)
+
+    sampled_indices = _farthest_point_sample_indices(candidate_points, point_count)
+    return candidate_points[sampled_indices], candidate_normals[sampled_indices]
 
 
 def _segment_surface_direction(
@@ -424,7 +599,11 @@ def compute_finger_surface_point_records(
     side: str,
     total_point_count: int,
     point_count_per_segment: int | None = None,
+    surface_source: str = "collision",
 ) -> tuple[list[dict[str, object]], np.ndarray]:
+    if surface_source not in {"collision", "visual"}:
+        raise ValueError("surface_source must be 'collision' or 'visual'.")
+
     palm_point = _palm_surface_point(model, data, side)
     palm_view_axis = _palm_view_axis(model, data, side)
     thumb_reference_point = _other_fingertip_centroid(model, data, side)
@@ -436,6 +615,7 @@ def compute_finger_surface_point_records(
     )
     point_records: list[dict[str, object]] = []
     segment_frames: dict[tuple[str, str], tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+    side_seed = 1000 if side == "right" else 2000
 
     for finger, segment in SEGMENT_SPECS:
         geom_name = f"inspire_collision_hand_{side}_{finger}_{segment}"
@@ -467,24 +647,47 @@ def compute_finger_surface_point_records(
             axis=axis,
             half_length=half_length,
         )
-        world_points = _sample_capsule_palm_strip_world_points(
-            center=center,
-            axis=axis,
-            palm_side=palm_side,
-            tangent=tangent,
-            radius=radius,
-            half_length=half_length,
-            point_count=target_counts[(finger, segment)],
-            excluded_axis_intervals=excluded_axis_intervals,
-        )
+        target_count = target_counts[(finger, segment)]
+        world_points = np.zeros((0, 3), dtype=float)
+        world_normals = np.zeros((0, 3), dtype=float)
+        if surface_source == "visual":
+            rng = np.random.default_rng(side_seed + 17 * SEGMENT_SPECS.index((finger, segment)))
+            world_points, world_normals = _sample_visual_segment_surface_world_points(
+                model,
+                data,
+                body_id=body_id,
+                center=center,
+                axis=axis,
+                palm_side=palm_side,
+                point_count=target_count,
+                excluded_axis_intervals=excluded_axis_intervals,
+                rng=rng,
+            )
+
+        if len(world_points) == 0:
+            world_points = _sample_capsule_palm_strip_world_points(
+                center=center,
+                axis=axis,
+                palm_side=palm_side,
+                tangent=tangent,
+                radius=radius,
+                half_length=half_length,
+                point_count=target_count,
+                excluded_axis_intervals=excluded_axis_intervals,
+            )
+            world_normals = np.stack(
+                [
+                    _normalize(world_point - center - axis * np.dot(world_point - center, axis))
+                    for world_point in world_points
+                ],
+                axis=0,
+            )
 
         body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id)
         body_pos = data.xpos[body_id]
         body_rot = data.xmat[body_id].reshape(3, 3)
 
-        for world_point in world_points:
-            radial_component = world_point - center - axis * np.dot(world_point - center, axis)
-            world_normal = _normalize(radial_component)
+        for world_point, world_normal in zip(world_points, world_normals, strict=True):
             final_world_point = world_point + POINT_NORMAL_OFFSET * world_normal
             point_records.append(
                 {
@@ -536,6 +739,7 @@ def _hide_hand_visual_geoms(model: mujoco.MjModel) -> None:
 def build_surface_point_model(
     side: str,
     hand_point_count: int,
+    surface_source: str = "collision",
 ) -> tuple[
     mujoco.MjModel,
     mujoco.MjData,
@@ -554,6 +758,7 @@ def build_surface_point_model(
         base_data,
         side=side,
         total_point_count=hand_point_count,
+        surface_source=surface_source,
     )
     palm_view_axis = _palm_view_axis(base_model, base_data, side)
     fingertip_point = _average_fingertip_point(base_model, base_data, side)
@@ -653,6 +858,12 @@ def parse_args() -> argparse.Namespace:
         help="Approximate total number of finger-surface points across ten finger segments.",
     )
     parser.add_argument(
+        "--surface-source",
+        choices=("collision", "visual"),
+        default="visual",
+        help="Sample hand surface points from collision primitives or visual meshes.",
+    )
+    parser.add_argument(
         "--snapshot",
         type=Path,
         default=None,
@@ -672,6 +883,7 @@ def main() -> None:
     model, data, hand_point_records, palm_point, palm_view_axis, fingertip_point = build_surface_point_model(
         side=args.hand,
         hand_point_count=args.hand_point_count,
+        surface_source=args.surface_source,
     )
 
     segment_labels = [_segment_label(record["finger"], record["segment"]) for record in hand_point_records]

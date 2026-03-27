@@ -3,6 +3,8 @@
 [scene]
 hand = "right"
 hand_points_per_joint = 10
+hand_penetration_sample_count = 1000
+hand_point_surface_source = "visual"
 object_body_name = "pickup_cylinder"
 object_geom_names = ["pickup_cylinder_geom"]
 
@@ -49,7 +51,7 @@ log_period = 250
 [loss]
 distance_weight = 100.0
 torque_weight = 2.0
-penetration_weight = 1.0
+penetration_weight = 100.0
 penetration_penalty_value = 1000000.0
 qpos_weight = 10.0
 qpos_edge_margin = 0.05

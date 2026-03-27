@@ -44,6 +44,8 @@ class SceneConfig:
     hand_points_per_joint: int
     object_body_name: str
     object_geom_names: tuple[str, ...]
+    hand_penetration_sample_count: int = 0
+    hand_point_surface_source: str = "collision"
 
 
 @dataclass(frozen=True)

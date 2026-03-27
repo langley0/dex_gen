@@ -38,13 +38,13 @@ from generate_grasp_candidates import (
     parse_hand_init_config,
     parse_qpos_excluded_joint_names,
     sample_initial_pose_sequence,
-    scene_penetration_depth,
 )
 from view_surface_points import HAND_ROLE_COLORS, SEGMENT_SPECS, compute_finger_surface_point_records
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "grasp_data_search.toml"
 FINGER_ORDER = ("thumb", "index", "middle", "ring", "pinky")
 HAND_COLLISION_GEOMGROUP = np.array([0, 0, 0, 1, 0, 0], dtype=np.uint8)
 PATH_BLOCK_RAY_EPS = 1.0e-4
+PENETRATION_SURFACE_EPS = 1.0e-3
 
 
 @dataclass(frozen=True)
@@ -111,8 +111,12 @@ class OptimizationScene:
     object_geom_ids: tuple[int, ...]
     point_records: list[dict[str, Any]]
     point_body_ids: tuple[int, ...]
+    point_body_index_array: np.ndarray
     point_local_positions: np.ndarray
     point_local_normals: np.ndarray
+    penetration_body_index_array: np.ndarray
+    penetration_local_positions: np.ndarray
+    penetration_area_weights: np.ndarray
     actuator_specs: list[HandActuatorSpec]
     qpos_lower: np.ndarray
     qpos_upper: np.ndarray
@@ -166,6 +170,8 @@ def load_optimizer_config(config_path: Path) -> OptimizerConfig:
         hand_points_per_joint=int(scene_raw["hand_points_per_joint"]),
         object_body_name=str(scene_raw["object_body_name"]),
         object_geom_names=tuple(str(name) for name in scene_raw["object_geom_names"]),
+        hand_penetration_sample_count=int(scene_raw.get("hand_penetration_sample_count", 1000)),
+        hand_point_surface_source=str(scene_raw.get("hand_point_surface_source", "visual")),
     )
     hand_pose = HandPoseConfig(
         sample_count=int(hand_pose_raw["sample_count"]),
@@ -237,6 +243,8 @@ def load_optimizer_config(config_path: Path) -> OptimizerConfig:
 def _validate_config(config: OptimizerConfig) -> None:
     if config.scene.hand not in {"right", "left"}:
         raise ValueError("scene.hand must be 'right' or 'left'.")
+    if config.scene.hand_point_surface_source not in {"collision", "visual"}:
+        raise ValueError("scene.hand_point_surface_source must be 'collision' or 'visual'.")
     if config.scene.hand_points_per_joint <= 0:
         raise ValueError("scene.hand_points_per_joint must be positive.")
     if config.hand_pose.sample_count <= 0:
@@ -249,6 +257,8 @@ def _validate_config(config: OptimizerConfig) -> None:
         raise ValueError("hand_pose.roll_search_steps must be positive.")
     if config.hand_pose.thumb_contact_weight <= 0.0:
         raise ValueError("hand_pose.thumb_contact_weight must be positive.")
+    if config.scene.hand_penetration_sample_count < 0:
+        raise ValueError("scene.hand_penetration_sample_count must be non-negative.")
     if config.contacts.contact_count <= 0:
         raise ValueError("contacts.contact_count must be positive.")
     if not 0.0 <= config.contacts.switch_possibility <= 1.0:
@@ -353,6 +363,348 @@ def _apply_state(scene: OptimizationScene, state: HandState) -> None:
     mujoco.mj_comPos(scene.model, scene.data)
 
 
+def _quat_to_matrix(quat: np.ndarray) -> np.ndarray:
+    matrix = np.zeros(9, dtype=float)
+    mujoco.mju_quat2Mat(matrix, np.asarray(quat, dtype=float))
+    return matrix.reshape(3, 3)
+
+
+def _geom_surface_area(geom_type: int, geom_size: np.ndarray) -> float:
+    if geom_type == int(mujoco.mjtGeom.mjGEOM_BOX):
+        hx, hy, hz = (float(value) for value in geom_size[:3])
+        return 8.0 * (hx * hy + hx * hz + hy * hz)
+    if geom_type == int(mujoco.mjtGeom.mjGEOM_SPHERE):
+        radius = float(geom_size[0])
+        return 4.0 * np.pi * radius * radius
+    if geom_type == int(mujoco.mjtGeom.mjGEOM_CAPSULE):
+        radius = float(geom_size[0])
+        half_length = float(geom_size[1])
+        return 4.0 * np.pi * radius * (half_length + radius)
+    if geom_type == int(mujoco.mjtGeom.mjGEOM_CYLINDER):
+        radius = float(geom_size[0])
+        half_height = float(geom_size[1])
+        return 4.0 * np.pi * radius * half_height + 2.0 * np.pi * radius * radius
+    return 0.0
+
+
+def _allocate_surface_sample_counts(surface_areas: np.ndarray, total_sample_count: int) -> np.ndarray:
+    counts = np.zeros(len(surface_areas), dtype=int)
+    valid_indices = np.flatnonzero(surface_areas > 0.0)
+    if total_sample_count <= 0 or valid_indices.size == 0:
+        return counts
+    if total_sample_count <= valid_indices.size:
+        order = valid_indices[np.argsort(surface_areas[valid_indices])[::-1]]
+        counts[order[:total_sample_count]] = 1
+        return counts
+
+    counts[valid_indices] = 1
+    remaining = total_sample_count - int(valid_indices.size)
+    weights = surface_areas[valid_indices] / float(np.sum(surface_areas[valid_indices]))
+    scaled = remaining * weights
+    extra = np.floor(scaled).astype(int)
+    counts[valid_indices] += extra
+    leftover = total_sample_count - int(np.sum(counts))
+    if leftover > 0:
+        fractional = scaled - extra
+        order = valid_indices[np.argsort(fractional)[::-1]]
+        counts[order[:leftover]] += 1
+    return counts
+
+
+def _sample_box_surface_local(
+    rng: np.random.Generator,
+    half_extents: np.ndarray,
+    sample_count: int,
+) -> np.ndarray:
+    if sample_count <= 0:
+        return np.zeros((0, 3), dtype=float)
+
+    hx, hy, hz = (float(value) for value in half_extents[:3])
+    face_areas = np.array(
+        [
+            4.0 * hy * hz,
+            4.0 * hy * hz,
+            4.0 * hx * hz,
+            4.0 * hx * hz,
+            4.0 * hx * hy,
+            4.0 * hx * hy,
+        ],
+        dtype=float,
+    )
+    face_ids = rng.choice(6, size=sample_count, p=face_areas / float(np.sum(face_areas)))
+    uv = rng.uniform(-1.0, 1.0, size=(sample_count, 2))
+    samples = np.zeros((sample_count, 3), dtype=float)
+
+    mask = face_ids == 0
+    samples[mask] = np.column_stack([np.full(np.sum(mask), hx), uv[mask, 0] * hy, uv[mask, 1] * hz])
+    mask = face_ids == 1
+    samples[mask] = np.column_stack([np.full(np.sum(mask), -hx), uv[mask, 0] * hy, uv[mask, 1] * hz])
+    mask = face_ids == 2
+    samples[mask] = np.column_stack([uv[mask, 0] * hx, np.full(np.sum(mask), hy), uv[mask, 1] * hz])
+    mask = face_ids == 3
+    samples[mask] = np.column_stack([uv[mask, 0] * hx, np.full(np.sum(mask), -hy), uv[mask, 1] * hz])
+    mask = face_ids == 4
+    samples[mask] = np.column_stack([uv[mask, 0] * hx, uv[mask, 1] * hy, np.full(np.sum(mask), hz)])
+    mask = face_ids == 5
+    samples[mask] = np.column_stack([uv[mask, 0] * hx, uv[mask, 1] * hy, np.full(np.sum(mask), -hz)])
+    return samples
+
+
+def _sample_sphere_surface_local(
+    rng: np.random.Generator,
+    radius: float,
+    sample_count: int,
+) -> np.ndarray:
+    if sample_count <= 0:
+        return np.zeros((0, 3), dtype=float)
+    directions = rng.normal(size=(sample_count, 3))
+    norms = np.linalg.norm(directions, axis=1, keepdims=True)
+    directions /= np.clip(norms, 1.0e-12, None)
+    return radius * directions
+
+
+def _sample_capsule_surface_local(
+    rng: np.random.Generator,
+    radius: float,
+    half_length: float,
+    sample_count: int,
+) -> np.ndarray:
+    if sample_count <= 0:
+        return np.zeros((0, 3), dtype=float)
+
+    cylinder_area = 4.0 * np.pi * radius * half_length
+    cap_area = 4.0 * np.pi * radius * radius
+    total_area = cylinder_area + cap_area
+    if total_area <= 0.0:
+        return np.zeros((sample_count, 3), dtype=float)
+
+    use_cylinder = rng.random(sample_count) < (cylinder_area / total_area)
+    samples = np.zeros((sample_count, 3), dtype=float)
+
+    cylinder_count = int(np.sum(use_cylinder))
+    if cylinder_count > 0:
+        theta = rng.uniform(0.0, 2.0 * np.pi, size=cylinder_count)
+        z = rng.uniform(-half_length, half_length, size=cylinder_count)
+        samples[use_cylinder] = np.column_stack([radius * np.cos(theta), radius * np.sin(theta), z])
+
+    cap_count = sample_count - cylinder_count
+    if cap_count > 0:
+        directions = rng.normal(size=(cap_count, 3))
+        norms = np.linalg.norm(directions, axis=1, keepdims=True)
+        directions /= np.clip(norms, 1.0e-12, None)
+        centers = np.zeros((cap_count, 3), dtype=float)
+        centers[:, 2] = np.where(directions[:, 2] >= 0.0, half_length, -half_length)
+        samples[~use_cylinder] = centers + radius * directions
+
+    return samples
+
+
+def _sample_cylinder_surface_local(
+    rng: np.random.Generator,
+    radius: float,
+    half_height: float,
+    sample_count: int,
+) -> np.ndarray:
+    if sample_count <= 0:
+        return np.zeros((0, 3), dtype=float)
+
+    side_area = 4.0 * np.pi * radius * half_height
+    cap_area = 2.0 * np.pi * radius * radius
+    total_area = side_area + cap_area
+    if total_area <= 0.0:
+        return np.zeros((sample_count, 3), dtype=float)
+
+    use_side = rng.random(sample_count) < (side_area / total_area)
+    samples = np.zeros((sample_count, 3), dtype=float)
+
+    side_count = int(np.sum(use_side))
+    if side_count > 0:
+        theta = rng.uniform(0.0, 2.0 * np.pi, size=side_count)
+        z = rng.uniform(-half_height, half_height, size=side_count)
+        samples[use_side] = np.column_stack([radius * np.cos(theta), radius * np.sin(theta), z])
+
+    cap_count = sample_count - side_count
+    if cap_count > 0:
+        theta = rng.uniform(0.0, 2.0 * np.pi, size=cap_count)
+        radial = radius * np.sqrt(rng.uniform(0.0, 1.0, size=cap_count))
+        z = np.where(rng.random(cap_count) < 0.5, half_height, -half_height)
+        samples[~use_side] = np.column_stack([radial * np.cos(theta), radial * np.sin(theta), z])
+
+    return samples
+
+
+def _sample_geom_surface_local(
+    rng: np.random.Generator,
+    geom_type: int,
+    geom_size: np.ndarray,
+    sample_count: int,
+) -> np.ndarray:
+    if geom_type == int(mujoco.mjtGeom.mjGEOM_BOX):
+        return _sample_box_surface_local(rng, geom_size[:3], sample_count)
+    if geom_type == int(mujoco.mjtGeom.mjGEOM_SPHERE):
+        return _sample_sphere_surface_local(rng, radius=float(geom_size[0]), sample_count=sample_count)
+    if geom_type == int(mujoco.mjtGeom.mjGEOM_CAPSULE):
+        return _sample_capsule_surface_local(
+            rng,
+            radius=float(geom_size[0]),
+            half_length=float(geom_size[1]),
+            sample_count=sample_count,
+        )
+    if geom_type == int(mujoco.mjtGeom.mjGEOM_CYLINDER):
+        return _sample_cylinder_surface_local(
+            rng,
+            radius=float(geom_size[0]),
+            half_height=float(geom_size[1]),
+            sample_count=sample_count,
+        )
+    return np.zeros((0, 3), dtype=float)
+
+
+def _build_hand_penetration_samples(
+    model: mujoco.MjModel,
+    side: str,
+    total_sample_count: int,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if total_sample_count <= 0:
+        return (
+            np.zeros(0, dtype=np.intp),
+            np.zeros((0, 3), dtype=float),
+            np.zeros(0, dtype=float),
+        )
+
+    geom_entries: list[tuple[int, float]] = []
+    geom_prefix = f"inspire_collision_hand_{side}_"
+    for geom_id in range(model.ngeom):
+        geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or ""
+        if not geom_name.startswith(geom_prefix):
+            continue
+        geom_type = int(model.geom_type[geom_id])
+        geom_area = _geom_surface_area(geom_type, model.geom_size[geom_id])
+        if geom_area <= 0.0:
+            continue
+        geom_entries.append((geom_id, geom_area))
+
+    if not geom_entries:
+        return (
+            np.zeros(0, dtype=np.intp),
+            np.zeros((0, 3), dtype=float),
+            np.zeros(0, dtype=float),
+        )
+
+    surface_areas = np.asarray([entry[1] for entry in geom_entries], dtype=float)
+    geom_sample_counts = _allocate_surface_sample_counts(surface_areas, total_sample_count)
+    total_surface_area = float(np.sum(surface_areas))
+
+    body_ids: list[np.ndarray] = []
+    local_positions: list[np.ndarray] = []
+    area_weights: list[np.ndarray] = []
+    for (geom_id, geom_area), sample_count in zip(geom_entries, geom_sample_counts, strict=True):
+        if sample_count <= 0:
+            continue
+        geom_type = int(model.geom_type[geom_id])
+        geom_local_positions = _sample_geom_surface_local(
+            rng,
+            geom_type=geom_type,
+            geom_size=model.geom_size[geom_id],
+            sample_count=int(sample_count),
+        )
+        if geom_local_positions.size == 0:
+            continue
+
+        geom_rot = _quat_to_matrix(model.geom_quat[geom_id])
+        geom_pos = model.geom_pos[geom_id].copy()
+        body_local_positions = geom_pos[None, :] + geom_local_positions @ geom_rot.T
+
+        body_ids.append(np.full(len(body_local_positions), int(model.geom_bodyid[geom_id]), dtype=np.intp))
+        local_positions.append(body_local_positions)
+        normalized_weight = geom_area / max(total_surface_area, 1.0e-12) / float(len(body_local_positions))
+        area_weights.append(np.full(len(body_local_positions), normalized_weight, dtype=float))
+
+    if not local_positions:
+        return (
+            np.zeros(0, dtype=np.intp),
+            np.zeros((0, 3), dtype=float),
+            np.zeros(0, dtype=float),
+        )
+
+    return (
+        np.concatenate(body_ids, axis=0),
+        np.concatenate(local_positions, axis=0),
+        np.concatenate(area_weights, axis=0),
+    )
+
+
+def _body_local_points_to_world(
+    scene: OptimizationScene,
+    body_index_array: np.ndarray,
+    local_positions: np.ndarray,
+) -> np.ndarray:
+    if local_positions.size == 0:
+        return np.zeros((0, 3), dtype=float)
+    body_positions = scene.data.xpos[body_index_array]
+    body_rotations = scene.data.xmat[body_index_array].reshape(-1, 3, 3)
+    return body_positions + np.einsum("nij,nj->ni", body_rotations, local_positions)
+
+
+def _batch_object_signed_distances(
+    scene: OptimizationScene,
+    world_positions: np.ndarray,
+) -> np.ndarray | None:
+    if (
+        scene.object_geom_type is None
+        or scene.object_geom_size is None
+        or scene.object_geom_pos is None
+        or scene.object_geom_rot is None
+    ):
+        return None
+    if world_positions.size == 0:
+        return np.zeros(0, dtype=float)
+
+    points_local = (world_positions - scene.object_geom_pos[None, :]) @ scene.object_geom_rot
+    geom_type = scene.object_geom_type
+    geom_size = scene.object_geom_size
+    if geom_type == int(mujoco.mjtGeom.mjGEOM_CYLINDER):
+        return _batch_cylinder_signed_distances(
+            points_local,
+            radius=float(geom_size[0]),
+            half_height=float(geom_size[1]),
+        )
+    if geom_type == int(mujoco.mjtGeom.mjGEOM_BOX):
+        return _batch_box_signed_distances(points_local, geom_size[:3])
+    if geom_type == int(mujoco.mjtGeom.mjGEOM_SPHERE):
+        return _batch_sphere_signed_distances(points_local, radius=float(geom_size[0]))
+    if geom_type == int(mujoco.mjtGeom.mjGEOM_CAPSULE):
+        return _batch_capsule_signed_distances(
+            points_local,
+            radius=float(geom_size[0]),
+            half_length=float(geom_size[1]),
+        )
+    return None
+
+
+def _scene_penetration_metrics_fast(scene: OptimizationScene) -> tuple[float, float]:
+    if scene.penetration_local_positions.size == 0:
+        return 0.0, 0.0
+
+    world_positions = _body_local_points_to_world(
+        scene,
+        scene.penetration_body_index_array,
+        scene.penetration_local_positions,
+    )
+    signed_distances = _batch_object_signed_distances(scene, world_positions)
+    if signed_distances is None or signed_distances.size == 0:
+        return 0.0, 0.0
+
+    penetration_depths = np.maximum(-(signed_distances + PENETRATION_SURFACE_EPS), 0.0)
+    if penetration_depths.size == 0:
+        return 0.0, 0.0
+
+    max_depth = float(np.max(penetration_depths))
+    penalty = float(np.sum(scene.penetration_area_weights * penetration_depths))
+    return penalty, max_depth
+
+
 def build_optimization_scene(
     config: OptimizerConfig,
     pose_sample: HandPoseSample,
@@ -364,6 +716,7 @@ def build_optimization_scene(
         side=config.scene.hand,
         total_point_count=config.scene.hand_points_per_joint * len(SEGMENT_SPECS),
         point_count_per_segment=config.scene.hand_points_per_joint,
+        surface_source=config.scene.hand_point_surface_source,
     )
 
     root_body_name = f"inspire_{config.scene.hand}_hand_base"
@@ -393,6 +746,7 @@ def build_optimization_scene(
     )
     if any(body_id < 0 for body_id in point_body_ids):
         raise ValueError("A hand point body name could not be resolved in the optimization scene.")
+    point_body_index_array = np.asarray(point_body_ids, dtype=np.intp)
     point_local_positions = np.asarray(
         [np.asarray(point_record["local_pos"], dtype=float) for point_record in hand_point_records],
         dtype=float,
@@ -400,6 +754,13 @@ def build_optimization_scene(
     point_local_normals = np.asarray(
         [np.asarray(point_record["local_normal"], dtype=float) for point_record in hand_point_records],
         dtype=float,
+    )
+    penetration_rng = np.random.default_rng(config.run.random_seed + 20011 * (pose_sample.sample_index + 1))
+    penetration_body_index_array, penetration_local_positions, penetration_area_weights = _build_hand_penetration_samples(
+        model,
+        side=config.scene.hand,
+        total_sample_count=config.scene.hand_penetration_sample_count,
+        rng=penetration_rng,
     )
 
     actuator_specs = describe_hand_actuators(model)
@@ -434,8 +795,12 @@ def build_optimization_scene(
         object_geom_ids=object_geom_ids,
         point_records=hand_point_records,
         point_body_ids=point_body_ids,
+        point_body_index_array=point_body_index_array,
         point_local_positions=point_local_positions,
         point_local_normals=point_local_normals,
+        penetration_body_index_array=penetration_body_index_array,
+        penetration_local_positions=penetration_local_positions,
+        penetration_area_weights=penetration_area_weights,
         actuator_specs=actuator_specs,
         qpos_lower=qpos_lower,
         qpos_upper=qpos_upper,
@@ -565,43 +930,15 @@ def _distance_only_contact_metrics_fast(
     scene: OptimizationScene,
     contact_indices: tuple[int, ...],
 ) -> tuple[np.ndarray, bool] | None:
-    if (
-        scene.object_geom_type is None
-        or scene.object_geom_size is None
-        or scene.object_geom_pos is None
-        or scene.object_geom_rot is None
-    ):
-        return None
     if len(contact_indices) == 0:
         return np.zeros(0, dtype=float), False
 
     contact_index_array = np.asarray(contact_indices, dtype=np.intp)
-    body_index_array = np.asarray(scene.point_body_ids, dtype=np.intp)[contact_index_array]
-    body_positions = scene.data.xpos[body_index_array]
-    body_rotations = scene.data.xmat[body_index_array].reshape(-1, 3, 3)
+    body_index_array = scene.point_body_index_array[contact_index_array]
     local_positions = scene.point_local_positions[contact_index_array]
-    world_positions = body_positions + np.einsum("nij,nj->ni", body_rotations, local_positions)
-    points_local = (world_positions - scene.object_geom_pos[None, :]) @ scene.object_geom_rot
-
-    geom_type = scene.object_geom_type
-    geom_size = scene.object_geom_size
-    if geom_type == int(mujoco.mjtGeom.mjGEOM_CYLINDER):
-        signed_distances = _batch_cylinder_signed_distances(
-            points_local,
-            radius=float(geom_size[0]),
-            half_height=float(geom_size[1]),
-        )
-    elif geom_type == int(mujoco.mjtGeom.mjGEOM_BOX):
-        signed_distances = _batch_box_signed_distances(points_local, geom_size[:3])
-    elif geom_type == int(mujoco.mjtGeom.mjGEOM_SPHERE):
-        signed_distances = _batch_sphere_signed_distances(points_local, radius=float(geom_size[0]))
-    elif geom_type == int(mujoco.mjtGeom.mjGEOM_CAPSULE):
-        signed_distances = _batch_capsule_signed_distances(
-            points_local,
-            radius=float(geom_size[0]),
-            half_length=float(geom_size[1]),
-        )
-    else:
+    world_positions = _body_local_points_to_world(scene, body_index_array, local_positions)
+    signed_distances = _batch_object_signed_distances(scene, world_positions)
+    if signed_distances is None:
         return None
 
     return np.abs(signed_distances), bool(np.any(signed_distances < 0.0))
@@ -707,17 +1044,21 @@ def calculate_energy(
         fast_result = _distance_only_contact_metrics_fast(scene, contact_indices)
         if fast_result is not None:
             distances, selected_penetration = fast_result
+            e_pen, penetration_depth = _scene_penetration_metrics_fast(scene)
             e_dis = float(np.sum(distances))
-            score = float(config.loss.distance_weight * e_dis)
+            score = float(
+                config.loss.distance_weight * e_dis
+                + config.loss.penetration_weight * e_pen
+            )
             metrics = GeneMetrics(
                 point_indices=contact_indices,
                 score=score,
                 e_dis=e_dis,
                 e_tq=0.0,
-                e_pen=0.0,
+                e_pen=e_pen,
                 e_qpos=0.0,
                 e_force=0.0,
-                scene_penetration_depth=0.0,
+                scene_penetration_depth=penetration_depth,
                 selected_penetration=bool(selected_penetration),
                 selected_path_blocked_count=0,
                 e_align=0.0,
@@ -736,17 +1077,21 @@ def calculate_energy(
         object_center=object_center,
         include_contacts=include_contacts,
     )
+    e_pen, penetration_depth = _scene_penetration_metrics_fast(scene)
     e_dis = float(np.sum(distances))
-    score = float(config.loss.distance_weight * e_dis)
+    score = float(
+        config.loss.distance_weight * e_dis
+        + config.loss.penetration_weight * e_pen
+    )
     metrics = GeneMetrics(
         point_indices=contact_indices,
         score=score,
         e_dis=e_dis,
         e_tq=0.0,
-        e_pen=0.0,
+        e_pen=e_pen,
         e_qpos=0.0,
         e_force=0.0,
-        scene_penetration_depth=0.0,
+        scene_penetration_depth=penetration_depth,
         selected_penetration=bool(selected_penetration),
         selected_path_blocked_count=int(blocked_path_count),
         e_align=0.0,
@@ -1149,6 +1494,8 @@ def save_candidate_json(
             "scene": {
                 "hand": config.scene.hand,
                 "hand_points_per_joint": config.scene.hand_points_per_joint,
+                "hand_penetration_sample_count": config.scene.hand_penetration_sample_count,
+                "hand_point_surface_source": config.scene.hand_point_surface_source,
                 "object_body_name": config.scene.object_body_name,
                 "object_geom_names": list(config.scene.object_geom_names),
             },
@@ -1211,6 +1558,8 @@ def save_candidate_json(
             "saved_candidate_count": len(limited_candidates),
             "hand_points_per_joint": config.scene.hand_points_per_joint,
             "hand_point_library_size_per_pose": config.scene.hand_points_per_joint * len(SEGMENT_SPECS),
+            "hand_penetration_sample_count": config.scene.hand_penetration_sample_count,
+            "hand_point_surface_source": config.scene.hand_point_surface_source,
             "optimizer": "simulated_annealing_rmsprop",
         },
         "pose_results": [
@@ -1318,8 +1667,12 @@ def build_best_candidate_snapshot(
         ),
         point_records=[],
         point_body_ids=(),
+        point_body_index_array=np.zeros(0, dtype=np.intp),
         point_local_positions=np.zeros((0, 3), dtype=float),
         point_local_normals=np.zeros((0, 3), dtype=float),
+        penetration_body_index_array=np.zeros(0, dtype=np.intp),
+        penetration_local_positions=np.zeros((0, 3), dtype=float),
+        penetration_area_weights=np.zeros(0, dtype=float),
         actuator_specs=describe_hand_actuators(model),
         qpos_lower=model.actuator_ctrlrange[:, 0].copy(),
         qpos_upper=model.actuator_ctrlrange[:, 1].copy(),
