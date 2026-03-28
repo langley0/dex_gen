@@ -1,16 +1,34 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol
 
 import mujoco
 import numpy as np
 
-from .hand import Hand, SEGS
+from .hand import SEGS
 
 
 HALF_ANGLE = np.deg2rad(55.0)
 POINT_OFFSET = 2.0e-3
 JOINT_CLEARANCE = 5.0e-3
+
+
+class _HandLike(Protocol):
+    model: mujoco.MjModel
+    data: mujoco.MjData
+    root_body_id: int
+    palm_site_id: int
+    tip_site_ids: dict[str, int]
+    segment_geom_ids: dict[tuple[str, str], int]
+
+    def apply_state(
+        self,
+        qpos: np.ndarray | None = None,
+        ctrl: np.ndarray | None = None,
+        root_pos: np.ndarray | None = None,
+        root_quat: np.ndarray | None = None,
+    ) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -113,11 +131,11 @@ def _role(finger: str, segment: str) -> str:
     return "distal" if finger == "thumb" else "intermediate"
 
 
-def _tip_mean(hand: Hand, fingers: tuple[str, ...]) -> np.ndarray:
+def _tip_mean(hand: _HandLike, fingers: tuple[str, ...]) -> np.ndarray:
     return np.mean(np.stack([hand.data.site_xpos[hand.tip_site_ids[finger]].copy() for finger in fingers], axis=0), axis=0)
 
 
-def _joint_x(hand: Hand, body_id: int, center: np.ndarray, axis: np.ndarray) -> float:
+def _joint_x(hand: _HandLike, body_id: int, center: np.ndarray, axis: np.ndarray) -> float:
     joint_count = int(hand.model.body_jntnum[body_id])
     if joint_count <= 0:
         return float(np.dot(hand.data.xpos[body_id] - center, axis))
@@ -125,7 +143,7 @@ def _joint_x(hand: Hand, body_id: int, center: np.ndarray, axis: np.ndarray) -> 
     return float(np.dot(hand.data.xanchor[joint_id] - center, axis))
 
 
-def _blocked(hand: Hand, frame: SegmentFrame, segment: str, cfg: ContactConfig) -> list[tuple[float, float]]:
+def _blocked(hand: _HandLike, frame: SegmentFrame, segment: str, cfg: ContactConfig) -> list[tuple[float, float]]:
     xs = [_joint_x(hand, frame.body_id, frame.center, frame.axis)]
     for child_id in range(hand.model.nbody):
         if hand.model.body_parentid[child_id] == frame.body_id:
@@ -136,7 +154,7 @@ def _blocked(hand: Hand, frame: SegmentFrame, segment: str, cfg: ContactConfig) 
     return _merge(intervals, -frame.half, frame.half)
 
 
-def _frame(hand: Hand, finger: str, segment: str, palm_axis: np.ndarray, thumb_ref: np.ndarray) -> SegmentFrame:
+def _frame(hand: _HandLike, finger: str, segment: str, palm_axis: np.ndarray, thumb_ref: np.ndarray) -> SegmentFrame:
     geom_id = hand.segment_geom_ids[(finger, segment)]
     center = hand.data.geom_xpos[geom_id].copy()
     rotation = hand.data.geom_xmat[geom_id].reshape(3, 3)
@@ -191,7 +209,7 @@ def _frame(hand: Hand, finger: str, segment: str, palm_axis: np.ndarray, thumb_r
 
 
 def build_contacts(
-    hand: Hand,
+    hand: _HandLike,
     *,
     qpos: np.ndarray | None = None,
     ctrl: np.ndarray | None = None,
@@ -236,7 +254,7 @@ def build_contacts(
 
 
 def contact_points_root(
-    hand: Hand,
+    hand: _HandLike,
     *,
     qpos: np.ndarray | None = None,
     ctrl: np.ndarray | None = None,
