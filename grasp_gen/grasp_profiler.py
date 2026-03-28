@@ -73,9 +73,6 @@ def profile_call(
 def block_grasp_energy(energy: GraspBatchEnergy) -> GraspBatchEnergy:
     jax.block_until_ready(energy.total)
     jax.block_until_ready(energy.distance)
-    jax.block_until_ready(energy.penetration)
-    jax.block_until_ready(energy.penetration_depth)
-    jax.block_until_ready(energy.selected_penetration)
     return energy
 
 

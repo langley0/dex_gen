@@ -9,21 +9,13 @@ import jax.numpy as jnp
 class GraspBatchEnergy(NamedTuple):
     total: jax.Array
     distance: jax.Array
-    penetration: jax.Array
-    penetration_depth: jax.Array
-    selected_penetration: jax.Array
 
     @classmethod
     def from_total(cls, total: jax.Array) -> "GraspBatchEnergy":
         total = jnp.asarray(total, dtype=jnp.float32)
-        zeros = jnp.zeros_like(total)
-        flags = jnp.zeros(total.shape, dtype=bool)
         return cls(
             total=total,
-            distance=zeros,
-            penetration=zeros,
-            penetration_depth=zeros,
-            selected_penetration=flags,
+            distance=total,
         )
 
     @property
@@ -65,4 +57,3 @@ class GraspBatchSnapshot(NamedTuple):
     accepted: jax.Array
     temperature: jax.Array
     step_size: jax.Array
-

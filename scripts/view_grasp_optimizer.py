@@ -31,9 +31,6 @@ class ViewBatch(NamedTuple):
     contact_indices: np.ndarray
     energy_total: np.ndarray
     energy_distance: np.ndarray
-    energy_penetration: np.ndarray
-    penetration_depth: np.ndarray
-    selected_penetration: np.ndarray
     step_index: int
 
 
@@ -47,9 +44,6 @@ class ViewSample(NamedTuple):
     contact_indices: np.ndarray
     energy_total: float
     energy_distance: float
-    energy_penetration: float
-    penetration_depth: float
-    selected_penetration: bool
 
 
 def _cam(cam: mujoco.MjvCamera) -> None:
@@ -271,9 +265,6 @@ def _select_view_batch(artifact, state_name: str) -> ViewBatch:
             contact_indices=np.asarray(state.best_contact_indices, dtype=np.int32),
             energy_total=np.asarray(energy.total, dtype=np.float32),
             energy_distance=np.asarray(energy.distance, dtype=np.float32),
-            energy_penetration=np.asarray(energy.penetration, dtype=np.float32),
-            penetration_depth=np.asarray(energy.penetration_depth, dtype=np.float32),
-            selected_penetration=np.asarray(energy.selected_penetration, dtype=bool),
             step_index=int(np.asarray(state.step_index)),
         )
 
@@ -283,9 +274,6 @@ def _select_view_batch(artifact, state_name: str) -> ViewBatch:
         contact_indices=np.asarray(state.contact_indices, dtype=np.int32),
         energy_total=np.asarray(energy.total, dtype=np.float32),
         energy_distance=np.asarray(energy.distance, dtype=np.float32),
-        energy_penetration=np.asarray(energy.penetration, dtype=np.float32),
-        penetration_depth=np.asarray(energy.penetration_depth, dtype=np.float32),
-        selected_penetration=np.asarray(energy.selected_penetration, dtype=bool),
         step_index=int(np.asarray(state.step_index)),
     )
 
@@ -329,9 +317,6 @@ def _sample_view(
         contact_indices=contact_indices,
         energy_total=float(batch.energy_total[sample_index]),
         energy_distance=float(batch.energy_distance[sample_index]),
-        energy_penetration=float(batch.energy_penetration[sample_index]),
-        penetration_depth=float(batch.penetration_depth[sample_index]),
-        selected_penetration=bool(batch.selected_penetration[sample_index]),
     )
 
 
@@ -341,14 +326,13 @@ def _state_text(hand: Hand, sample: ViewSample, batch: ViewBatch, sample_index: 
         (
             f"sample={sample_index} step={batch.step_index} "
             f"energy={sample.energy_total:.6f} "
-            f"(distance={sample.energy_distance:.6f}, penetration={sample.energy_penetration:.6f})"
+            f"(distance={sample.energy_distance:.6f})"
         ),
         (
             "root 6dof      : "
             f"xyz=[{sample.root_pos[0]: .4f}, {sample.root_pos[1]: .4f}, {sample.root_pos[2]: .4f}] "
             f"rpy_deg=[{root_rpy[0]: .1f}, {root_rpy[1]: .1f}, {root_rpy[2]: .1f}]"
         ),
-        f"penetration     : selected={int(sample.selected_penetration)} max_depth={sample.penetration_depth:.6f}",
         "selected points :",
     ]
     for slot, (point_index, record) in enumerate(zip(sample.contact_indices.tolist(), sample.selected_contacts)):

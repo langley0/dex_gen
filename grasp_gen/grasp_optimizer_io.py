@@ -23,19 +23,18 @@ def _energy_arrays(prefix: str, energy: GraspBatchEnergy) -> dict[str, np.ndarra
     return {
         f"{prefix}_total": np.asarray(energy.total, dtype=np.float32),
         f"{prefix}_distance": np.asarray(energy.distance, dtype=np.float32),
-        f"{prefix}_penetration": np.asarray(energy.penetration, dtype=np.float32),
-        f"{prefix}_penetration_depth": np.asarray(energy.penetration_depth, dtype=np.float32),
-        f"{prefix}_selected_penetration": np.asarray(energy.selected_penetration, dtype=bool),
     }
 
 
 def _arrays_to_energy(data: dict[str, np.ndarray], prefix: str) -> GraspBatchEnergy:
+    distance_key = f"{prefix}_distance"
+    if distance_key in data:
+        distance = jnp.asarray(data[distance_key], dtype=jnp.float32)
+    else:
+        distance = jnp.asarray(data[f"{prefix}_total"], dtype=jnp.float32)
     return GraspBatchEnergy(
         total=jnp.asarray(data[f"{prefix}_total"], dtype=jnp.float32),
-        distance=jnp.asarray(data[f"{prefix}_distance"], dtype=jnp.float32),
-        penetration=jnp.asarray(data[f"{prefix}_penetration"], dtype=jnp.float32),
-        penetration_depth=jnp.asarray(data[f"{prefix}_penetration_depth"], dtype=jnp.float32),
-        selected_penetration=jnp.asarray(data[f"{prefix}_selected_penetration"], dtype=bool),
+        distance=distance,
     )
 
 

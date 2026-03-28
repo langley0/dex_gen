@@ -72,7 +72,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--offset", type=float, default=0.30, help="Initial target-to-palm distance.")
     parser.add_argument("--distance-weight", type=float, default=1.0)
-    parser.add_argument("--penetration-weight", type=float, default=0.0)
     parser.add_argument("--bench-steps", type=int, default=256, help="Extra compiled-loop steps for steady-state timing. Set 0 to disable.")
     parser.add_argument("--output", type=Path, default=None, help="Result .npz path. Defaults to outputs/grasp_optimizer/...")
     return parser.parse_args()
@@ -109,7 +108,6 @@ def main() -> None:
     )
     energy_cfg = GraspEnergyConfig(
         distance_weight=args.distance_weight,
-        penetration_weight=args.penetration_weight,
     )
     optimizer_cfg = GraspBatchOptimizerConfig()
 

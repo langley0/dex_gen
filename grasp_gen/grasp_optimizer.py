@@ -250,13 +250,6 @@ class GraspBatchOptimizer:
             next_energy = GraspBatchEnergy(
                 total=jnp.where(accept, proposed_energy.total, current_energy.total),
                 distance=jnp.where(accept, proposed_energy.distance, current_energy.distance),
-                penetration=jnp.where(accept, proposed_energy.penetration, current_energy.penetration),
-                penetration_depth=jnp.where(accept, proposed_energy.penetration_depth, current_energy.penetration_depth),
-                selected_penetration=jnp.where(
-                    accept,
-                    proposed_energy.selected_penetration,
-                    current_energy.selected_penetration,
-                ),
             )
 
             is_new_best = next_energy.total < (state.best_energy.total - BEST_ENERGY_EPS)
@@ -265,13 +258,6 @@ class GraspBatchOptimizer:
             best_energy = GraspBatchEnergy(
                 total=jnp.where(is_new_best, next_energy.total, state.best_energy.total),
                 distance=jnp.where(is_new_best, next_energy.distance, state.best_energy.distance),
-                penetration=jnp.where(is_new_best, next_energy.penetration, state.best_energy.penetration),
-                penetration_depth=jnp.where(is_new_best, next_energy.penetration_depth, state.best_energy.penetration_depth),
-                selected_penetration=jnp.where(
-                    is_new_best,
-                    next_energy.selected_penetration,
-                    state.best_energy.selected_penetration,
-                ),
             )
 
             next_state = GraspBatchState(

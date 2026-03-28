@@ -32,8 +32,6 @@ class HandEnergySpec(NamedTuple):
 
 class PropMeshSpec(NamedTuple):
     triangles_local: jax.Array
-    triangle_normals_local: jax.Array
-    triangle_centers_local: jax.Array
     center_world: jax.Array
     rotation_world: jax.Array
 
@@ -41,7 +39,6 @@ class PropMeshSpec(NamedTuple):
 @dataclass(frozen=True)
 class GraspEnergyConfig:
     distance_weight: float = 1.0
-    penetration_weight: float = 0.0
     root_position_margin: float = 0.35
     root_height_floor: float = 0.03
 
@@ -50,13 +47,6 @@ def _quat_to_matrix_np(quat: np.ndarray) -> np.ndarray:
     matrix = np.zeros(9, dtype=float)
     mujoco.mju_quat2Mat(matrix, np.asarray(quat, dtype=float))
     return matrix.reshape(3, 3)
-
-
-def _normalize_np(vector: np.ndarray, fallback: np.ndarray) -> np.ndarray:
-    norm = float(np.linalg.norm(vector))
-    if norm <= ORTHO6D_EPS:
-        return np.asarray(fallback, dtype=float)
-    return np.asarray(vector, dtype=float) / norm
 
 
 def _safe_normalize_jax(vector: jax.Array, fallback: jax.Array) -> jax.Array:
@@ -151,13 +141,6 @@ def _dot(a: jax.Array, b: jax.Array) -> jax.Array:
     return jnp.sum(a * b, axis=-1)
 
 
-def _gather_triangle_attr(attr: jax.Array, triangle_index: jax.Array) -> jax.Array:
-    batch_size = int(triangle_index.shape[0])
-    contact_count = int(triangle_index.shape[1])
-    tiled = jnp.broadcast_to(attr[None, None, :, :], (batch_size, contact_count, attr.shape[0], attr.shape[1]))
-    return jnp.take_along_axis(tiled, triangle_index[..., None, None], axis=2)[..., 0, :]
-
-
 def _closest_points_on_triangles(points_local: jax.Array, mesh: PropMeshSpec) -> tuple[jax.Array, jax.Array, jax.Array]:
     points = points_local[:, :, None, :]
     triangles = mesh.triangles_local[None, None, :, :, :]
@@ -213,20 +196,6 @@ def _closest_points_on_triangles(points_local: jax.Array, mesh: PropMeshSpec) ->
     return unsigned, triangle_index, nearest_points
 
 
-def _mesh_signed_distance(points_local: jax.Array, mesh: PropMeshSpec) -> tuple[jax.Array, jax.Array]:
-    unsigned, triangle_index, nearest_points = _closest_points_on_triangles(points_local, mesh)
-    nearest_centers = _gather_triangle_attr(mesh.triangle_centers_local, triangle_index)
-    nearest_normals = _gather_triangle_attr(mesh.triangle_normals_local, triangle_index)
-    nearest_ref = jnp.where(
-        jnp.linalg.norm(nearest_points - nearest_centers, axis=-1, keepdims=True) > TRIANGLE_EPS,
-        nearest_points,
-        nearest_centers,
-    )
-    plane_offset = jnp.sum((points_local - nearest_ref) * nearest_normals, axis=-1)
-    signed = jnp.where(plane_offset < 0.0, -unsigned, unsigned)
-    return signed, triangle_index
-
-
 def _hand_qpos_limits(hand: Hand) -> tuple[jax.Array, jax.Array]:
     lower = np.full(hand.model.nq, -np.inf, dtype=np.float32)
     upper = np.full(hand.model.nq, np.inf, dtype=np.float32)
@@ -259,23 +228,8 @@ def _extract_hand_spec(hand: Hand, contact_cfg: ContactConfig) -> HandEnergySpec
 
 def _extract_prop_mesh(prop: Prop) -> PropMeshSpec:
     triangles_local = np.asarray(prop.vertices[prop.faces], dtype=np.float32)
-    raw_normals = np.cross(
-        triangles_local[:, 1] - triangles_local[:, 0],
-        triangles_local[:, 2] - triangles_local[:, 0],
-    )
-    mesh_center = np.mean(np.asarray(prop.vertices, dtype=np.float32), axis=0)
-    triangle_centers = np.mean(triangles_local, axis=1)
-    outward = triangle_centers - mesh_center[None, :]
-    flipped = np.sum(raw_normals * outward, axis=1) < 0.0
-    raw_normals[flipped] *= -1.0
-    triangle_normals = np.stack(
-        [_normalize_np(normal, np.array([0.0, 0.0, 1.0], dtype=np.float32)) for normal in raw_normals],
-        axis=0,
-    ).astype(np.float32)
     return PropMeshSpec(
         triangles_local=jnp.asarray(triangles_local, dtype=jnp.float32),
-        triangle_normals_local=jnp.asarray(triangle_normals, dtype=jnp.float32),
-        triangle_centers_local=jnp.asarray(triangle_centers, dtype=jnp.float32),
         center_world=jnp.asarray(prop.pos, dtype=jnp.float32),
         rotation_world=jnp.asarray(_quat_to_matrix_np(prop.quat), dtype=jnp.float32),
     )
@@ -334,16 +288,9 @@ class GraspEnergyModel:
             selected_world_positions - self.prop_mesh.center_world[None, None, :],
             self.prop_mesh.rotation_world,
         )
-        signed_distance, _ = _mesh_signed_distance(selected_local_positions, self.prop_mesh)
-        penetration_depth = jnp.maximum(-signed_distance, 0.0)
-        distance_energy = jnp.asarray(self.config.distance_weight, dtype=jnp.float32) * jnp.sum(jnp.abs(signed_distance), axis=1)
-        penetration_energy = (
-            jnp.asarray(self.config.penetration_weight, dtype=jnp.float32) * jnp.sum(penetration_depth, axis=1)
-        )
+        distance_to_surface, _, _ = _closest_points_on_triangles(selected_local_positions, self.prop_mesh)
+        distance_energy = jnp.asarray(self.config.distance_weight, dtype=jnp.float32) * jnp.sum(distance_to_surface, axis=1)
         return GraspBatchEnergy(
-            total=distance_energy + penetration_energy,
+            total=distance_energy,
             distance=distance_energy,
-            penetration=penetration_energy,
-            penetration_depth=jnp.max(penetration_depth, axis=1),
-            selected_penetration=jnp.any(signed_distance < 0.0, axis=1),
         )
