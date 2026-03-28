@@ -40,6 +40,7 @@ from generate_grasp_candidates import (
     resolve_random_seed,
     sample_initial_pose_sequence,
 )
+from jax_batched_grasp_opt import run_batched_pose_optimization
 from view_surface_points import HAND_ROLE_COLORS, SEGMENT_SPECS, compute_finger_surface_point_records
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "grasp_data_search.toml"
 FINGER_ORDER = ("thumb", "index", "middle", "ring", "pinky")
@@ -1205,6 +1206,45 @@ def _state_trace_entry(
     }
 
 
+def _state_trace_entry_from_values(
+    step: int,
+    state_vector: np.ndarray,
+    contact_indices: np.ndarray | tuple[int, ...],
+    score: float,
+    e_dis: float,
+    e_pen: float,
+    penetration_depth: float,
+    selected_penetration: bool,
+    temperature: float,
+    step_size: float,
+    accepted: bool | None,
+) -> dict[str, Any]:
+    state = _unpack_state(np.asarray(state_vector, dtype=float))
+    metrics = GeneMetrics(
+        point_indices=tuple(int(value) for value in np.asarray(contact_indices, dtype=np.intp).tolist()),
+        score=float(score),
+        e_dis=float(e_dis),
+        e_tq=0.0,
+        e_pen=float(e_pen),
+        e_qpos=0.0,
+        e_force=0.0,
+        scene_penetration_depth=float(penetration_depth),
+        selected_penetration=bool(selected_penetration),
+        selected_path_blocked_count=0,
+        e_align=0.0,
+        e_palm=0.0,
+    )
+    return _state_trace_entry(
+        step=step,
+        state=state,
+        contact_indices=metrics.point_indices,
+        metrics=metrics,
+        temperature=temperature,
+        step_size=step_size,
+        accepted=accepted,
+    )
+
+
 def _state_epsilons(scene: OptimizationScene, config: OptimizerConfig) -> np.ndarray:
     return np.concatenate(
         [
@@ -1396,93 +1436,61 @@ class AnnealingRMSPropOptimizer:
 def build_pose_search_results(
     config: OptimizerConfig,
 ) -> tuple[list[PoseSearchResult], list[dict[str, Any]]]:
-    pose_results: list[PoseSearchResult] = []
-    candidate_records: list[dict[str, Any]] = []
+    pose_samples = sample_initial_pose_sequence(config)
+    if not pose_samples:
+        return [], []
 
-    for pose_sample in sample_initial_pose_sequence(config):
+    for pose_sample in pose_samples:
         sample_index = pose_sample.sample_index
         print(
             f"[pose {sample_index:02d}] init_dist={np.linalg.norm(pose_sample.palm_world_pos - pose_sample.anchor_world_pos):.4f} "
             f"roll={pose_sample.palm_roll_deg:.1f}deg thumb={np.rad2deg(pose_sample.hand_ctrl[0]):.1f}deg"
         )
 
-        scene = build_optimization_scene(config, pose_sample)
-        rng = np.random.default_rng(config.run.random_seed + 1009 * sample_index)
-        point_count = len(scene.point_records)
-        initial_contact_indices = make_random_contact_indices(rng, point_count, config.contacts)
-        optimizer = AnnealingRMSPropOptimizer(
-            scene=scene,
-            config=config,
-            rng=rng,
-            initial_state=scene.initial_state,
-            initial_contact_indices=initial_contact_indices,
-            point_count=point_count,
-        )
+    scenes = [build_optimization_scene(config, pose_sample) for pose_sample in pose_samples]
+    batched_results = run_batched_pose_optimization(
+        config=config,
+        scenes=scenes,
+        pose_samples=pose_samples,
+        contact_finger_fn=_contact_fingers,
+        state_trace_entry_fn=_state_trace_entry_from_values,
+    )
 
-        step_stats: list[dict[str, Any]] = []
-        for step in range(1, config.optimize.max_steps + 1):
-            optimizer.try_step()
-            proposed_metrics, _ = calculate_energy(
-                scene,
-                optimizer.proposed_contact_indices,
-                optimizer.proposed_state,
-                config,
-                include_contacts=False,
-            )
-            accepted = optimizer.assess_step(proposed_metrics)
-            current_fingers = _contact_fingers(optimizer.current_contact_indices, scene.point_records)
+    pose_results: list[PoseSearchResult] = []
+    candidate_records: list[dict[str, Any]] = []
 
-            if (
-                step == 1
-                or step % config.optimize.log_period == 0
-                or step == config.optimize.max_steps
-            ):
-                print(
-                    f"[pose {sample_index:02d}] step={step:04d} energy={optimizer.current_metrics.score:.6f} "
-                    f"accepted={int(accepted)} temp={optimizer.temperature:.4f} "
-                    f"step_size={optimizer.step_size:.5f} k={len(optimizer.current_contact_indices)} "
-                    f"fingers={','.join(current_fingers)}"
-                )
-
-            if (
-                step % config.optimize.trace_stride == 0
-                or step == config.optimize.max_steps
-            ):
-                step_stats.append(
-                    {
-                        "step": int(step),
-                        "score": float(optimizer.current_metrics.score),
-                        "accepted": bool(accepted),
-                        "temperature": float(optimizer.temperature),
-                        "step_size": float(optimizer.step_size),
-                        "contact_count": len(optimizer.current_contact_indices),
-                        "fingers": list(current_fingers),
-                    }
-                )
-
+    for pose_sample, scene, batched_result in zip(pose_samples, scenes, batched_results, strict=True):
+        sample_index = pose_sample.sample_index
+        final_state = _unpack_state(batched_result.best_state_vector)
         final_metrics, final_contacts = calculate_energy(
             scene,
-            optimizer.best_contact_indices,
-            optimizer.best_state,
+            batched_result.best_contact_indices,
+            final_state,
             config,
             include_contacts=True,
         )
         result = AnnealingOptimizationResult(
-            contact_indices=optimizer.best_contact_indices,
-            initial_contact_indices=tuple(initial_contact_indices),
-            final_state=optimizer.best_state,
+            contact_indices=batched_result.best_contact_indices,
+            initial_contact_indices=batched_result.initial_contact_indices,
+            final_state=final_state,
             metrics=final_metrics,
             contacts=final_contacts,
-            trace=optimizer.trace,
+            trace=batched_result.trace,
             optimize_steps=config.optimize.max_steps,
             optimize_stop_reason=f"max_steps({config.optimize.max_steps})",
-            fingers=_contact_fingers(optimizer.best_contact_indices, scene.point_records),
-            accepted_steps=optimizer.accepted_steps,
-            rejected_steps=optimizer.rejected_steps,
-            final_temperature=float(optimizer.temperature),
-            final_step_size=float(optimizer.step_size),
+            fingers=_contact_fingers(batched_result.best_contact_indices, scene.point_records),
+            accepted_steps=batched_result.accepted_steps,
+            rejected_steps=batched_result.rejected_steps,
+            final_temperature=float(batched_result.final_temperature),
+            final_step_size=float(batched_result.final_step_size),
         )
-        pose_results.append(PoseSearchResult(pose_sample=pose_sample, result=result, step_stats=step_stats))
+        pose_results.append(
+            PoseSearchResult(
+                pose_sample=pose_sample,
+                result=result,
+                step_stats=batched_result.step_stats,
+            )
+        )
 
         candidate_records.append(
             {
@@ -1496,7 +1504,7 @@ def build_pose_search_results(
                 "initial_hand_root_pos": _json_array(pose_sample.root_pos),
                 "initial_hand_root_quat": _json_array(pose_sample.root_quat),
                 "initial_hand_qpos": _json_array(pose_sample.hand_qpos),
-                "initial_point_indices": [int(value) for value in result.initial_contact_indices],
+                "initial_point_indices": [int(value) for value in batched_result.initial_contact_indices],
                 "palm_world_pos": _json_array(pose_sample.palm_world_pos),
                 "palm_world_normal": _json_array(pose_sample.palm_world_normal),
                 "palm_roll_deg": float(pose_sample.palm_roll_deg),
@@ -1522,7 +1530,7 @@ def build_pose_search_results(
                 "final_temperature": float(result.final_temperature),
                 "final_step_size": float(result.final_step_size),
                 "optimization_trace": result.trace,
-                "step_stats": step_stats,
+                "step_stats": batched_result.step_stats,
                 "contacts": [
                     {
                         "point_index": probe.point_index,

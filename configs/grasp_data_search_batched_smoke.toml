@@ -1,0 +1,66 @@
+# Small smoke-test config for the JAX batched optimizer path.
+
+[scene]
+hand = "right"
+hand_points_per_joint = 10
+hand_penetration_sample_count = 1000
+hand_point_surface_source = "visual"
+object_body_name = "pickup_cylinder"
+object_geom_names = ["pickup_cylinder_geom"]
+
+[hand_pose]
+sample_count = 2
+surface_offset = 0.30
+surface_candidate_count = 48
+roll_search_steps = 72
+distance_std_weight = 0.75
+distance_max_weight = 0.25
+accessible_normal_min_z = -0.25
+thumb_contact_weight = 4.0
+
+[hand_init]
+flexion_min_rad = 0.1
+flexion_max_rad = 0.25
+thumb_pinch_rad = 1.5707963267948966
+thumb_non_yaw_zero = true
+
+[contacts]
+contact_count = 4
+switch_possibility = 0.5
+
+[run]
+random_seed = 12345
+candidate_limit = 20
+
+[optimize]
+max_steps = 5
+starting_temperature = 1.0
+temperature_decay = 0.95
+annealing_period = 50
+step_size = 0.02
+stepsize_period = 50
+mu = 0.1
+position_epsilon = 0.002
+quat_epsilon = 0.010
+qpos_epsilon = 0.010
+gradient_clip = 10.0
+root_position_margin = 0.25
+trace_stride = 1
+log_period = 1
+
+[loss]
+distance_weight = 100.0
+torque_weight = 2.0
+penetration_weight = 100.0
+penetration_penalty_value = 1000000.0
+qpos_weight = 10.0
+qpos_edge_margin = 0.05
+qpos_excluded_joint_names = ["right_thumb_proximal_yaw_joint"]
+contact_alignment_weight = 10.0
+contact_alignment_min_dot = 0.2
+palm_alignment_weight = 4.0
+palm_alignment_min_dot = 0.1
+
+[output]
+candidate_json = "generated/grasp_data_batched_smoke.json"
+snapshot = "generated/grasp_data_batched_smoke.png"
