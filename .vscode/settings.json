@@ -1,0 +1,9 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "python.terminal.activateEnvironment": true,
+  "python.analysis.stubPath": "${workspaceFolder}/typings",
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/grasp_gen",
+    "${workspaceFolder}/scripts"
+  ]
+}

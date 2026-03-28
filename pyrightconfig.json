@@ -1,0 +1,14 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "stubPath": "typings",
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": [
+        "grasp_gen",
+        "scripts"
+      ]
+    }
+  ]
+}
