@@ -26,7 +26,6 @@ from grasp_gen.grasp_profiler import (
 )
 from grasp_gen.hand import Hand, InitConfig
 from grasp_gen.hand_contacts import ContactConfig
-from grasp_gen.prop import Prop
 from grasp_gen.prop_assets import make_named_prop
 
 
@@ -37,8 +36,8 @@ def _make_prop(args: argparse.Namespace) -> tuple[Prop, dict[str, object]]:
     return make_named_prop(args.object, cube_size=float(args.cube_size))
 
 
-def _default_output_path(batch: int, steps: int, seed: int, equilibrium_mode: str, object_kind: str) -> Path:
-    return ROOT / "outputs" / "grasp_optimizer" / f"run_{object_kind}_b{batch}_s{steps}_seed{seed}_eq{equilibrium_mode}.npz"
+def _default_output_path(batch: int, steps: int, seed: int, object_kind: str) -> Path:
+    return ROOT / "outputs" / "grasp_optimizer" / f"run_{object_kind}_b{batch}_s{steps}_seed{seed}_eqwrench.npz"
 
 
 def _result_stats(state) -> dict[str, float | int]:
@@ -76,14 +75,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--offset", type=float, default=0.30, help="Initial target-to-palm distance.")
     parser.add_argument("--distance-weight", type=float, default=1.0)
-    parser.add_argument(
-        "--equilibrium",
-        choices=("none", "torque", "simple", "wrench"),
-        default="none",
-        help="Equilibrium energy mode.",
-    )
     parser.add_argument("--equilibrium-weight", type=float, default=1.0)
-    parser.add_argument("--wrench-iters", type=int, default=24, help="Projected-gradient iterations for wrench mode.")
+    parser.add_argument("--wrench-iters", type=int, default=24, help="Projected-gradient iterations for wrench equilibrium.")
     parser.add_argument("--bench-steps", type=int, default=256, help="Extra compiled-loop steps for steady-state timing. Set 0 to disable.")
     parser.add_argument("--output", type=Path, default=None, help="Result .npz path. Defaults to outputs/grasp_optimizer/...")
     return parser.parse_args()
@@ -111,7 +104,7 @@ def main() -> None:
         raise SystemExit("--wrench-iters must be positive.")
 
     output_path = (
-        _default_output_path(args.batch, args.steps, args.seed, args.equilibrium, args.object)
+        _default_output_path(args.batch, args.steps, args.seed, args.object)
         if args.output is None
         else args.output.resolve()
     )
@@ -130,7 +123,6 @@ def main() -> None:
     )
     energy_cfg = GraspEnergyConfig(
         distance_weight=args.distance_weight,
-        equilibrium_mode=args.equilibrium,
         equilibrium_weight=args.equilibrium_weight,
         wrench_iters=args.wrench_iters,
     )
@@ -216,7 +208,7 @@ def main() -> None:
     print(f"contact count    : {args.contact_count}")
     print(f"candidate count  : {energy_model.point_count}")
     print(f"object kind      : {args.object}")
-    print(f"equilibrium mode : {args.equilibrium}")
+    print("equilibrium mode : wrench")
     print(f"best energy mean : {result_stats['best_energy_mean']:.6f}")
     print(f"best energy min  : {result_stats['best_energy_min']:.6f}")
     print(f"best eq mean     : {result_stats['best_equilibrium_mean']:.6f}")

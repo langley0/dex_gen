@@ -14,10 +14,7 @@ from .prop import Prop
 from .grasp_equilibrium import (
     EquilibriumTerms,
     mesh_scale_np,
-    simple_terms,
-    torque_terms,
     triangle_normals_local_np,
-    validate_mode,
     wrench_terms,
     zero_terms,
 )
@@ -61,7 +58,6 @@ class GraspBatchDiagnostics(NamedTuple):
 @dataclass(frozen=True)
 class GraspEnergyConfig:
     distance_weight: float = 1.0
-    equilibrium_mode: str = "none"
     equilibrium_weight: float = 1.0
     wrench_iters: int = 24
     root_position_margin: float = 0.35
@@ -280,7 +276,6 @@ class GraspEnergyModel:
         self.prop = prop
         self.contact_cfg = ContactConfig() if contact_cfg is None else contact_cfg
         self.config = GraspEnergyConfig() if config is None else config
-        self._equilibrium_mode = validate_mode(self.config.equilibrium_mode)
         if self.config.equilibrium_weight < 0.0:
             raise ValueError("equilibrium_weight must be non-negative.")
         if self.config.wrench_iters <= 0:
@@ -316,22 +311,8 @@ class GraspEnergyModel:
     ) -> EquilibriumTerms:
         batch_size = int(nearest_world_positions.shape[0])
         contact_count = int(nearest_world_positions.shape[1])
-        if self._equilibrium_mode == "none":
+        if self.config.equilibrium_weight <= 0.0:
             return zero_terms(batch_size, contact_count, dtype=nearest_world_positions)
-        if self._equilibrium_mode == "torque":
-            return torque_terms(
-                nearest_world_positions,
-                nearest_world_normals,
-                self.prop_mesh.com_world,
-                jnp.broadcast_to(self.prop_mesh.scale, (batch_size,)),
-            )
-        if self._equilibrium_mode == "simple":
-            return simple_terms(
-                nearest_world_positions,
-                nearest_world_normals,
-                self.prop_mesh.com_world,
-                jnp.broadcast_to(self.prop_mesh.scale, (batch_size,)),
-            )
         return wrench_terms(
             nearest_world_positions,
             nearest_world_normals,

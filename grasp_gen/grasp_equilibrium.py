@@ -8,7 +8,6 @@ import numpy as np
 
 
 BALANCE_EPS = 1.0e-8
-VALID_MODES = ("none", "torque", "simple", "wrench")
 
 
 class EquilibriumTerms(NamedTuple):
@@ -35,13 +34,6 @@ def mesh_scale_np(vertices: np.ndarray) -> float:
     centered = np.asarray(vertices, dtype=float) - np.mean(np.asarray(vertices, dtype=float), axis=0, keepdims=True)
     scale = float(np.max(np.linalg.norm(centered, axis=1)))
     return max(scale, 1.0e-6)
-
-
-def validate_mode(mode: str) -> str:
-    mode = str(mode).lower()
-    if mode not in VALID_MODES:
-        raise ValueError(f"equilibrium mode must be one of {VALID_MODES}, got {mode!r}")
-    return mode
 
 
 def zero_terms(
@@ -79,60 +71,6 @@ def _weighted_result(
     torque_residual = jnp.linalg.norm(weighted_torque, axis=1)
     torque_scaled = torque_residual / jnp.maximum(object_scale, BALANCE_EPS)
     return weighted_force, weighted_torque, force_residual, torque_residual, torque_scaled
-
-
-def torque_terms(
-    nearest_points_world: jax.Array,
-    nearest_normals_world: jax.Array,
-    object_center_world: jax.Array,
-    object_scale: jax.Array,
-) -> EquilibriumTerms:
-    batch_size = int(nearest_points_world.shape[0])
-    contact_count = int(nearest_points_world.shape[1])
-    forces = -nearest_normals_world
-    torques = jnp.cross(nearest_points_world - object_center_world[None, None, :], forces)
-    weights = _uniform_weights(batch_size, contact_count, nearest_points_world)
-    sum_force, sum_torque, force_residual, torque_residual, torque_scaled = _weighted_result(
-        forces,
-        torques,
-        weights,
-        object_scale,
-    )
-    return EquilibriumTerms(
-        energy=torque_scaled,
-        force_residual=force_residual,
-        torque_residual=torque_residual,
-        sum_force=sum_force,
-        sum_torque=sum_torque,
-        contact_weights=weights,
-    )
-
-
-def simple_terms(
-    nearest_points_world: jax.Array,
-    nearest_normals_world: jax.Array,
-    object_center_world: jax.Array,
-    object_scale: jax.Array,
-) -> EquilibriumTerms:
-    batch_size = int(nearest_points_world.shape[0])
-    contact_count = int(nearest_points_world.shape[1])
-    forces = -nearest_normals_world
-    torques = jnp.cross(nearest_points_world - object_center_world[None, None, :], forces)
-    weights = _uniform_weights(batch_size, contact_count, nearest_points_world)
-    sum_force, sum_torque, force_residual, torque_residual, torque_scaled = _weighted_result(
-        forces,
-        torques,
-        weights,
-        object_scale,
-    )
-    return EquilibriumTerms(
-        energy=force_residual + torque_scaled,
-        force_residual=force_residual,
-        torque_residual=torque_residual,
-        sum_force=sum_force,
-        sum_torque=sum_torque,
-        contact_weights=weights,
-    )
 
 
 def _project_simplex(weights: jax.Array) -> jax.Array:

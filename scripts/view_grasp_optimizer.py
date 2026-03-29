@@ -358,9 +358,9 @@ def main() -> None:
         palm_clearance=float(contact_meta["palm_clearance"]),
     )
     energy_meta = metadata.get("energy", {})
+    equilibrium_mode = str(energy_meta.get("equilibrium_mode", "wrench"))
     energy_cfg = GraspEnergyConfig(
         distance_weight=float(energy_meta.get("distance_weight", 1.0)),
-        equilibrium_mode=str(energy_meta.get("equilibrium_mode", "none")),
         equilibrium_weight=float(energy_meta.get("equilibrium_weight", 0.0)),
         wrench_iters=int(energy_meta.get("wrench_iters", 24)),
         root_position_margin=float(energy_meta.get("root_position_margin", 0.35)),
@@ -384,7 +384,7 @@ def main() -> None:
     print(f"object kind      : {metadata['prop'].get('kind', 'unknown')}")
     print(f"view state       : {args.state}")
     print(f"sample index     : {sample_index}")
-    print(f"equilibrium mode : {energy_cfg.equilibrium_mode}")
+    print(f"equilibrium mode : {equilibrium_mode}")
     if "best_sample_index" in result_meta:
         print(f"best sample idx  : {result_meta['best_sample_index']}")
     if not args.hide_points:
@@ -395,7 +395,7 @@ def main() -> None:
         print("viewer style     : bright background enabled")
     if args.hide_points:
         print("viewer overlay   : point markers hidden")
-    print(_state_text(hand, sample, batch, sample_index, equilibrium_mode=energy_cfg.equilibrium_mode), flush=True)
+    print(_state_text(hand, sample, batch, sample_index, equilibrium_mode=equilibrium_mode), flush=True)
 
     with mujoco.viewer.launch_passive(model, data) as viewer:
         _cam(viewer.cam)
