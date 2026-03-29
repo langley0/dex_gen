@@ -179,6 +179,8 @@ def main() -> None:
         n_per_seg=init_cfg.n_per_seg,
         thumb_weight=init_cfg.thumb_weight,
         palm_clearance=init_cfg.palm_clearance,
+        target_spacing=init_cfg.contact_spacing,
+        cloud_scale=init_cfg.contact_cloud_scale,
     )
     contacts = hand.contacts(cfg=contact_cfg)
     body_counts = Counter(record.body_name for record in contacts)
@@ -192,6 +194,8 @@ def main() -> None:
     print(f"qpos / ctrl    : {hand.model.nq} / {hand.model.nu}")
     print(f"contact points : {len(contacts)}")
     print(f"per segment    : {args.points}")
+    print(f"target spacing : {init_cfg.contact_spacing:.3f} m")
+    print(f"cloud scale    : {init_cfg.contact_cloud_scale:.5f}")
     print(f"target         : [{TARGET[0]:.3f}, {TARGET[1]:.3f}, {TARGET[2]:.3f}]")
     print(f"palm offset    : {args.offset:.3f}")
     print(f"start index    : {start_index}")

@@ -9,9 +9,9 @@ import mujoco
 import numpy as np
 
 from .hand import Hand, InitConfig
-from .hand_sdf import HandSdfSpec, build_hand_sdf_spec, hand_signed_distance
 from .hand_contacts import ContactConfig
 from .prop import Prop
+from .prop_sdf import PropSDFConfig, build_prop_sdf_grid
 from .grasp_equilibrium import (
     EquilibriumTerms,
     mesh_scale_np,
@@ -24,7 +24,7 @@ from .grasp_optimizer_state import GraspBatchEnergy
 
 ORTHO6D_EPS = 1.0e-8
 TRIANGLE_EPS = 1.0e-12
-PENETRATION_REFERENCE_POINTS = 2000.0
+PENETRATION_REFERENCE_POINT_COUNT = 2000.0
 
 
 class HandEnergySpec(NamedTuple):
@@ -37,6 +37,8 @@ class HandEnergySpec(NamedTuple):
     qpos_upper: jax.Array
     contact_body_indices: jax.Array
     contact_local_positions: jax.Array
+    cloud_body_indices: jax.Array
+    cloud_local_positions: jax.Array
 
 
 class PropMeshSpec(NamedTuple):
@@ -46,39 +48,31 @@ class PropMeshSpec(NamedTuple):
     com_world: jax.Array
     rotation_world: jax.Array
     scale: jax.Array
-    surface_points_world: jax.Array
-    surface_point_count: int
-
-
-class _PenetrationTerms(NamedTuple):
-    signed_distance: jax.Array
-    depth: jax.Array
-    count: jax.Array
-    depth_sum: jax.Array
-    max_depth: jax.Array
+    sdf_min_local: jax.Array
+    sdf_max_local: jax.Array
+    sdf_voxel_size: jax.Array
+    sdf_values: jax.Array
 
 
 class GraspBatchDiagnostics(NamedTuple):
     energy: GraspBatchEnergy
     nearest_world_positions: jax.Array
     nearest_world_normals: jax.Array
+    cloud_world_positions: jax.Array
+    penetration_depths: jax.Array
     sum_force: jax.Array
     sum_torque: jax.Array
     contact_weights: jax.Array
-    surface_points_world: jax.Array
-    surface_signed_distance: jax.Array
-    penetration_depth: jax.Array
-    penetration_count: jax.Array
-    penetration_depth_sum: jax.Array
-    max_penetration_depth: jax.Array
 
 
 @dataclass(frozen=True)
 class GraspEnergyConfig:
     distance_weight: float = 1.0
-    penetration_weight: float = 100.0
     equilibrium_weight: float = 1.0
+    penetration_weight: float = 100.0
     wrench_iters: int = 24
+    sdf_voxel_size: float = 3.0e-3
+    sdf_padding: float = 1.0e-2
     root_position_margin: float = 0.35
     root_height_floor: float = 0.03
 
@@ -236,6 +230,54 @@ def _closest_points_on_triangles(points_local: jax.Array, mesh: PropMeshSpec) ->
     return unsigned, triangle_index, nearest_points
 
 
+def _sample_sdf_grid(points_local: jax.Array, mesh: PropMeshSpec) -> jax.Array:
+    voxel = jnp.asarray(mesh.sdf_voxel_size, dtype=jnp.float32)
+    min_corner = mesh.sdf_min_local
+    max_corner = mesh.sdf_max_local
+    dims = jnp.asarray(mesh.sdf_values.shape, dtype=jnp.int32)
+
+    grid_coord = (points_local - min_corner[None, None, :]) / voxel
+    base = jnp.floor(grid_coord).astype(jnp.int32)
+    frac = grid_coord - base.astype(jnp.float32)
+    base = jnp.clip(base, 0, dims[None, None, :] - 2)
+
+    x0 = base[..., 0]
+    y0 = base[..., 1]
+    z0 = base[..., 2]
+    x1 = x0 + 1
+    y1 = y0 + 1
+    z1 = z0 + 1
+
+    c000 = mesh.sdf_values[x0, y0, z0]
+    c001 = mesh.sdf_values[x0, y0, z1]
+    c010 = mesh.sdf_values[x0, y1, z0]
+    c011 = mesh.sdf_values[x0, y1, z1]
+    c100 = mesh.sdf_values[x1, y0, z0]
+    c101 = mesh.sdf_values[x1, y0, z1]
+    c110 = mesh.sdf_values[x1, y1, z0]
+    c111 = mesh.sdf_values[x1, y1, z1]
+
+    fx = frac[..., 0]
+    fy = frac[..., 1]
+    fz = frac[..., 2]
+
+    c00 = c000 * (1.0 - fx) + c100 * fx
+    c01 = c001 * (1.0 - fx) + c101 * fx
+    c10 = c010 * (1.0 - fx) + c110 * fx
+    c11 = c011 * (1.0 - fx) + c111 * fx
+    c0 = c00 * (1.0 - fy) + c10 * fy
+    c1 = c01 * (1.0 - fy) + c11 * fy
+    sampled = c0 * (1.0 - fz) + c1 * fz
+
+    outside = jnp.maximum(
+        jnp.maximum(min_corner[None, None, :] - points_local, points_local - max_corner[None, None, :]),
+        0.0,
+    )
+    outside_sq = jnp.sum(jnp.square(outside), axis=-1)
+    outside_norm = jnp.sqrt(jnp.maximum(outside_sq, ORTHO6D_EPS)) * (outside_sq > ORTHO6D_EPS)
+    return sampled + outside_norm
+
+
 def _hand_qpos_limits(hand: Hand) -> tuple[jax.Array, jax.Array]:
     lower = np.full(hand.model.nq, -np.inf, dtype=np.float32)
     upper = np.full(hand.model.nq, np.inf, dtype=np.float32)
@@ -250,6 +292,8 @@ def _extract_hand_spec(hand: Hand, contact_cfg: ContactConfig) -> HandEnergySpec
         n_per_seg=contact_cfg.n_per_seg,
         thumb_weight=contact_cfg.thumb_weight,
         palm_clearance=contact_cfg.palm_clearance,
+        contact_spacing=contact_cfg.target_spacing,
+        contact_cloud_scale=contact_cfg.cloud_scale,
     )
     contact_batch = hand._contact_batch(contact_init_cfg)
     qpos_lower, qpos_upper = _hand_qpos_limits(hand)
@@ -263,19 +307,24 @@ def _extract_hand_spec(hand: Hand, contact_cfg: ContactConfig) -> HandEnergySpec
         qpos_upper=qpos_upper,
         contact_body_indices=contact_batch.body_indices,
         contact_local_positions=contact_batch.local_positions,
+        cloud_body_indices=contact_batch.dense_body_indices,
+        cloud_local_positions=contact_batch.dense_local_positions,
     )
 
 
-def _extract_prop_mesh(prop: Prop) -> PropMeshSpec:
+def _extract_prop_mesh(prop: Prop, config: GraspEnergyConfig) -> PropMeshSpec:
     triangles_local = np.asarray(prop.vertices[prop.faces], dtype=np.float32)
     triangle_normals_local = triangle_normals_local_np(triangles_local)
     rotation_world = _quat_to_matrix_np(prop.quat)
     origin_world = np.asarray(prop.pos, dtype=np.float32)
     com_world = origin_world + rotation_world @ np.asarray(prop.com_local, dtype=np.float32)
-    if prop.surface_cloud is None:
-        raise ValueError("Prop.surface_cloud must be set before building the grasp energy model.")
-    surface_points_local = np.asarray(prop.surface_cloud.points_local, dtype=np.float32)
-    surface_points_world = origin_world[None, :] + surface_points_local @ rotation_world.T
+    sdf_grid = build_prop_sdf_grid(
+        prop,
+        PropSDFConfig(
+            voxel_size=float(config.sdf_voxel_size),
+            padding=float(config.sdf_padding),
+        ),
+    )
     return PropMeshSpec(
         triangles_local=jnp.asarray(triangles_local, dtype=jnp.float32),
         triangle_normals_local=jnp.asarray(triangle_normals_local, dtype=jnp.float32),
@@ -283,8 +332,10 @@ def _extract_prop_mesh(prop: Prop) -> PropMeshSpec:
         com_world=jnp.asarray(com_world, dtype=jnp.float32),
         rotation_world=jnp.asarray(rotation_world, dtype=jnp.float32),
         scale=jnp.asarray(mesh_scale_np(prop.vertices), dtype=jnp.float32),
-        surface_points_world=jnp.asarray(surface_points_world, dtype=jnp.float32),
-        surface_point_count=int(len(surface_points_local)),
+        sdf_min_local=jnp.asarray(sdf_grid.min_corner_local, dtype=jnp.float32),
+        sdf_max_local=jnp.asarray(sdf_grid.max_corner_local, dtype=jnp.float32),
+        sdf_voxel_size=jnp.asarray(sdf_grid.voxel_size, dtype=jnp.float32),
+        sdf_values=jnp.asarray(sdf_grid.values, dtype=jnp.float32),
     )
 
 
@@ -301,24 +352,22 @@ class GraspEnergyModel:
         self.prop = prop
         self.contact_cfg = ContactConfig() if contact_cfg is None else contact_cfg
         self.config = GraspEnergyConfig() if config is None else config
-        if self.config.penetration_weight < 0.0:
-            raise ValueError("penetration_weight must be non-negative.")
         if self.config.equilibrium_weight < 0.0:
             raise ValueError("equilibrium_weight must be non-negative.")
+        if self.config.penetration_weight < 0.0:
+            raise ValueError("penetration_weight must be non-negative.")
         if self.config.wrench_iters <= 0:
             raise ValueError("wrench_iters must be positive.")
+        if self.config.sdf_voxel_size <= 0.0:
+            raise ValueError("sdf_voxel_size must be positive.")
+        if self.config.sdf_padding < 0.0:
+            raise ValueError("sdf_padding must be non-negative.")
         self.hand_spec = _extract_hand_spec(hand, self.contact_cfg)
-        self.hand_sdf = build_hand_sdf_spec(hand)
-        self.prop_mesh = _extract_prop_mesh(prop)
-        self.effective_penetration_weight = float(self._effective_penetration_weight())
+        self.prop_mesh = _extract_prop_mesh(prop, self.config)
         self.pose_dim = 9 + int(hand.model.nq)
         self.point_count = int(self.hand_spec.contact_local_positions.shape[0])
-
-    def _effective_penetration_weight(self) -> jax.Array:
-        point_count = max(int(self.prop_mesh.surface_point_count), 1)
-        base = jnp.asarray(self.config.penetration_weight, dtype=jnp.float32)
-        scale = jnp.asarray(PENETRATION_REFERENCE_POINTS / float(point_count), dtype=jnp.float32)
-        return base * scale
+        self.cloud_point_count = int(self.hand_spec.cloud_local_positions.shape[0])
+        self.effective_penetration_weight = self._effective_penetration_weight()
 
     def project(self, hand_pose: jax.Array) -> jax.Array:
         hand_pose = jnp.asarray(hand_pose, dtype=jnp.float32)
@@ -339,6 +388,11 @@ class GraspEnergyModel:
         hand_qpos = jnp.clip(hand_qpos, self.hand_spec.qpos_lower[None, :], self.hand_spec.qpos_upper[None, :])
         return jnp.concatenate([root_pos, root_rot6d, hand_qpos], axis=1)
 
+    def _effective_penetration_weight(self) -> float:
+        if self.cloud_point_count <= 0:
+            raise ValueError("hand penetration cloud must contain at least one point.")
+        return float(self.config.penetration_weight) * PENETRATION_REFERENCE_POINT_COUNT / float(self.cloud_point_count)
+
     def _equilibrium_terms(
         self,
         nearest_world_positions: jax.Array,
@@ -356,32 +410,6 @@ class GraspEnergyModel:
             iterations=self.config.wrench_iters,
         )
 
-    def _penetration_terms(
-        self,
-        body_positions: jax.Array,
-        body_rotations: jax.Array,
-    ) -> _PenetrationTerms:
-        batch_size = int(body_positions.shape[0])
-        point_count = int(self.prop_mesh.surface_points_world.shape[0])
-        surface_points_world = jnp.broadcast_to(
-            self.prop_mesh.surface_points_world[None, :, :],
-            (batch_size, point_count, 3),
-        )
-        surface_signed_distance = hand_signed_distance(
-            self.hand_sdf,
-            body_positions,
-            body_rotations,
-            surface_points_world,
-        )
-        penetration_depth = jnp.maximum(-surface_signed_distance, 0.0)
-        return _PenetrationTerms(
-            signed_distance=surface_signed_distance,
-            depth=penetration_depth,
-            count=jnp.sum(penetration_depth > 0.0, axis=1, dtype=jnp.int32),
-            depth_sum=jnp.sum(penetration_depth, axis=1),
-            max_depth=jnp.max(penetration_depth, axis=1),
-        )
-
     def diagnostics(self, hand_pose: jax.Array, contact_indices: jax.Array) -> GraspBatchDiagnostics:
         hand_pose = jnp.asarray(hand_pose, dtype=jnp.float32)
         body_positions, body_rotations = _forward_kinematics_batch(self.hand_spec, hand_pose)
@@ -390,6 +418,23 @@ class GraspEnergyModel:
             body_rotations,
             self.hand_spec.contact_body_indices,
             self.hand_spec.contact_local_positions,
+        )
+        cloud_world_positions = _body_local_points_to_world(
+            body_positions,
+            body_rotations,
+            self.hand_spec.cloud_body_indices,
+            self.hand_spec.cloud_local_positions,
+        )
+        cloud_local_positions = jnp.einsum(
+            "bkj,jm->bkm",
+            cloud_world_positions - self.prop_mesh.origin_world[None, None, :],
+            self.prop_mesh.rotation_world,
+        )
+        penetration_signed_distance = _sample_sdf_grid(cloud_local_positions, self.prop_mesh)
+        penetration_depths = jnp.maximum(-penetration_signed_distance, 0.0)
+        penetration_energy = jnp.asarray(self.effective_penetration_weight, dtype=jnp.float32) * jnp.sum(
+            penetration_depths,
+            axis=1,
         )
         batch_indices = jnp.arange(contact_world_positions.shape[0], dtype=jnp.int32)[:, None]
         selected_world_positions = contact_world_positions[batch_indices, contact_indices]
@@ -415,14 +460,12 @@ class GraspEnergyModel:
         )
         distance_energy = jnp.asarray(self.config.distance_weight, dtype=jnp.float32) * jnp.sum(distance_to_surface, axis=1)
         equilibrium_terms = self._equilibrium_terms(nearest_world_positions, nearest_world_normals)
-        penetration_terms = self._penetration_terms(body_positions, body_rotations)
-        penetration_energy = self._effective_penetration_weight() * penetration_terms.depth_sum
         equilibrium_energy = jnp.asarray(self.config.equilibrium_weight, dtype=jnp.float32) * equilibrium_terms.energy
         energy = GraspBatchEnergy(
-            total=distance_energy + penetration_energy + equilibrium_energy,
+            total=distance_energy + equilibrium_energy + penetration_energy,
             distance=distance_energy,
-            penetration=penetration_energy,
             equilibrium=equilibrium_energy,
+            penetration=penetration_energy,
             force=equilibrium_terms.force_residual,
             torque=equilibrium_terms.torque_residual,
         )
@@ -430,15 +473,11 @@ class GraspEnergyModel:
             energy=energy,
             nearest_world_positions=nearest_world_positions,
             nearest_world_normals=nearest_world_normals,
+            cloud_world_positions=cloud_world_positions,
+            penetration_depths=penetration_depths,
             sum_force=equilibrium_terms.sum_force,
             sum_torque=equilibrium_terms.sum_torque,
             contact_weights=equilibrium_terms.contact_weights,
-            surface_points_world=self.prop_mesh.surface_points_world,
-            surface_signed_distance=penetration_terms.signed_distance,
-            penetration_depth=penetration_terms.depth,
-            penetration_count=penetration_terms.count,
-            penetration_depth_sum=penetration_terms.depth_sum,
-            max_penetration_depth=penetration_terms.max_depth,
         )
 
     def energy(self, hand_pose: jax.Array, contact_indices: jax.Array) -> GraspBatchEnergy:

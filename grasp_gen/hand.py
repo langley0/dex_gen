@@ -22,6 +22,7 @@ HAND_XML = {
 }
 TARGET = np.zeros(3, dtype=float)
 ORTHO_EPS = 1.0e-8
+CONTACT_CLOUD_SCALE = 1.00935
 FINGERS = ("thumb", "index", "middle", "ring", "pinky")
 SEGS = (
     ("thumb", "1"),
@@ -62,6 +63,8 @@ class InitConfig:
     n_per_seg: int = 10
     thumb_weight: float = 4.0
     palm_clearance: float = 8.0e-3
+    contact_spacing: float = 5.0e-3
+    contact_cloud_scale: float = CONTACT_CLOUD_SCALE
     palm_offset: float = 0.30
     roll_steps: int = 72
     std_weight: float = 0.75
@@ -135,6 +138,8 @@ class _ContactBatch(NamedTuple):
     body_indices: jax.Array
     local_positions: jax.Array
     weights: jax.Array
+    dense_body_indices: jax.Array
+    dense_local_positions: jax.Array
 
 
 class _JointBatch(NamedTuple):
@@ -739,12 +744,18 @@ class Hand:
         return body_pos + np.einsum("nij,nj->ni", body_rot, local_pos)
 
     def _contact_batch(self, cfg: InitConfig) -> _ContactBatch:
-        key = (int(cfg.n_per_seg), float(cfg.thumb_weight), float(cfg.palm_clearance))
+        key = (
+            int(cfg.n_per_seg),
+            float(cfg.thumb_weight),
+            float(cfg.palm_clearance),
+            float(cfg.contact_spacing),
+            float(cfg.contact_cloud_scale),
+        )
         cached = self._contact_cache.get(key)
         if cached is not None:
             return cached
 
-        from .hand_contacts import ContactConfig, build_contacts
+        from .hand_contacts import ContactConfig, build_surface_cloud, sample_contacts
 
         self.apply_state(
             qpos=self.model.qpos0.copy(),
@@ -752,16 +763,22 @@ class Hand:
             root_pos=self.root_home_pos,
             root_quat=self.root_home_quat,
         )
-        records = build_contacts(
+        contact_cfg = ContactConfig(
+            n_per_seg=cfg.n_per_seg,
+            thumb_weight=cfg.thumb_weight,
+            palm_clearance=cfg.palm_clearance,
+            target_spacing=cfg.contact_spacing,
+            cloud_scale=cfg.contact_cloud_scale,
+        )
+        surface_records = build_surface_cloud(
             self,
             qpos=self.model.qpos0.copy(),
             ctrl=np.zeros(self.model.nu, dtype=float),
-            cfg=ContactConfig(
-                n_per_seg=cfg.n_per_seg,
-                thumb_weight=cfg.thumb_weight,
-                palm_clearance=cfg.palm_clearance,
-            ),
+            cfg=contact_cfg,
         )
+        records = sample_contacts(self, surface_records, cfg=contact_cfg)
+        if not surface_records:
+            raise ValueError("No hand surface cloud points were generated for the batch initializer.")
         if not records:
             raise ValueError("No hand contact records were generated for the batch initializer.")
 
@@ -769,6 +786,8 @@ class Hand:
             body_indices=jnp.asarray([self._body_id_map[int(record.body_id)] for record in records], dtype=jnp.int32),
             local_positions=jnp.asarray([record.local_pos for record in records], dtype=jnp.float32),
             weights=jnp.asarray([record.weight for record in records], dtype=jnp.float32),
+            dense_body_indices=jnp.asarray([self._body_id_map[int(record.body_id)] for record in surface_records], dtype=jnp.int32),
+            dense_local_positions=jnp.asarray([record.local_pos for record in surface_records], dtype=jnp.float32),
         )
         self._contact_cache[key] = cached
         return cached

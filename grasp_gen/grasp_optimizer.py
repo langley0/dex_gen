@@ -297,6 +297,7 @@ class GraspBatchOptimizer:
                 distance=jnp.where(accept, proposed_energy.distance, current_energy.distance),
                 penetration=jnp.where(accept, proposed_energy.penetration, current_energy.penetration),
                 equilibrium=jnp.where(accept, proposed_energy.equilibrium, current_energy.equilibrium),
+                penetration=jnp.where(accept, proposed_energy.penetration, current_energy.penetration),
                 force=jnp.where(accept, proposed_energy.force, current_energy.force),
                 torque=jnp.where(accept, proposed_energy.torque, current_energy.torque),
             )
@@ -309,6 +310,7 @@ class GraspBatchOptimizer:
                 distance=jnp.where(is_new_best, next_energy.distance, state.best_energy.distance),
                 penetration=jnp.where(is_new_best, next_energy.penetration, state.best_energy.penetration),
                 equilibrium=jnp.where(is_new_best, next_energy.equilibrium, state.best_energy.equilibrium),
+                penetration=jnp.where(is_new_best, next_energy.penetration, state.best_energy.penetration),
                 force=jnp.where(is_new_best, next_energy.force, state.best_energy.force),
                 torque=jnp.where(is_new_best, next_energy.torque, state.best_energy.torque),
             )
