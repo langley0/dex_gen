@@ -24,6 +24,7 @@ from .grasp_optimizer_state import GraspBatchEnergy
 
 ORTHO6D_EPS = 1.0e-8
 TRIANGLE_EPS = 1.0e-12
+PENETRATION_REFERENCE_POINTS = 2000.0
 
 
 class HandEnergySpec(NamedTuple):
@@ -46,6 +47,7 @@ class PropMeshSpec(NamedTuple):
     rotation_world: jax.Array
     scale: jax.Array
     surface_points_world: jax.Array
+    surface_point_count: int
 
 
 class _PenetrationTerms(NamedTuple):
@@ -282,6 +284,7 @@ def _extract_prop_mesh(prop: Prop) -> PropMeshSpec:
         rotation_world=jnp.asarray(rotation_world, dtype=jnp.float32),
         scale=jnp.asarray(mesh_scale_np(prop.vertices), dtype=jnp.float32),
         surface_points_world=jnp.asarray(surface_points_world, dtype=jnp.float32),
+        surface_point_count=int(len(surface_points_local)),
     )
 
 
@@ -307,8 +310,15 @@ class GraspEnergyModel:
         self.hand_spec = _extract_hand_spec(hand, self.contact_cfg)
         self.hand_sdf = build_hand_sdf_spec(hand)
         self.prop_mesh = _extract_prop_mesh(prop)
+        self.effective_penetration_weight = float(self._effective_penetration_weight())
         self.pose_dim = 9 + int(hand.model.nq)
         self.point_count = int(self.hand_spec.contact_local_positions.shape[0])
+
+    def _effective_penetration_weight(self) -> jax.Array:
+        point_count = max(int(self.prop_mesh.surface_point_count), 1)
+        base = jnp.asarray(self.config.penetration_weight, dtype=jnp.float32)
+        scale = jnp.asarray(PENETRATION_REFERENCE_POINTS / float(point_count), dtype=jnp.float32)
+        return base * scale
 
     def project(self, hand_pose: jax.Array) -> jax.Array:
         hand_pose = jnp.asarray(hand_pose, dtype=jnp.float32)
@@ -406,7 +416,7 @@ class GraspEnergyModel:
         distance_energy = jnp.asarray(self.config.distance_weight, dtype=jnp.float32) * jnp.sum(distance_to_surface, axis=1)
         equilibrium_terms = self._equilibrium_terms(nearest_world_positions, nearest_world_normals)
         penetration_terms = self._penetration_terms(body_positions, body_rotations)
-        penetration_energy = jnp.asarray(self.config.penetration_weight, dtype=jnp.float32) * penetration_terms.depth_sum
+        penetration_energy = self._effective_penetration_weight() * penetration_terms.depth_sum
         equilibrium_energy = jnp.asarray(self.config.equilibrium_weight, dtype=jnp.float32) * equilibrium_terms.energy
         energy = GraspBatchEnergy(
             total=distance_energy + penetration_energy + equilibrium_energy,

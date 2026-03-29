@@ -10,11 +10,11 @@ SURFACE_EPS = 1.0e-12
 
 @dataclass(frozen=True)
 class SurfaceCloudConfig:
-    spacing: float = 0.01
+    spacing: float = 0.005
     seed: int = 0
     oversample: int = 6
     min_points: int = 256
-    max_points: int | None = 4096
+    max_points: int | None = None
 
 
 @dataclass(frozen=True)
