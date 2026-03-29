@@ -250,6 +250,9 @@ class GraspBatchOptimizer:
             next_energy = GraspBatchEnergy(
                 total=jnp.where(accept, proposed_energy.total, current_energy.total),
                 distance=jnp.where(accept, proposed_energy.distance, current_energy.distance),
+                equilibrium=jnp.where(accept, proposed_energy.equilibrium, current_energy.equilibrium),
+                force=jnp.where(accept, proposed_energy.force, current_energy.force),
+                torque=jnp.where(accept, proposed_energy.torque, current_energy.torque),
             )
 
             is_new_best = next_energy.total < (state.best_energy.total - BEST_ENERGY_EPS)
@@ -258,6 +261,9 @@ class GraspBatchOptimizer:
             best_energy = GraspBatchEnergy(
                 total=jnp.where(is_new_best, next_energy.total, state.best_energy.total),
                 distance=jnp.where(is_new_best, next_energy.distance, state.best_energy.distance),
+                equilibrium=jnp.where(is_new_best, next_energy.equilibrium, state.best_energy.equilibrium),
+                force=jnp.where(is_new_best, next_energy.force, state.best_energy.force),
+                torque=jnp.where(is_new_best, next_energy.torque, state.best_energy.torque),
             )
 
             next_state = GraspBatchState(

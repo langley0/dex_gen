@@ -23,18 +23,28 @@ def _energy_arrays(prefix: str, energy: GraspBatchEnergy) -> dict[str, np.ndarra
     return {
         f"{prefix}_total": np.asarray(energy.total, dtype=np.float32),
         f"{prefix}_distance": np.asarray(energy.distance, dtype=np.float32),
+        f"{prefix}_equilibrium": np.asarray(energy.equilibrium, dtype=np.float32),
+        f"{prefix}_force": np.asarray(energy.force, dtype=np.float32),
+        f"{prefix}_torque": np.asarray(energy.torque, dtype=np.float32),
     }
 
 
 def _arrays_to_energy(data: dict[str, np.ndarray], prefix: str) -> GraspBatchEnergy:
     distance_key = f"{prefix}_distance"
+    equilibrium_key = f"{prefix}_equilibrium"
+    force_key = f"{prefix}_force"
+    torque_key = f"{prefix}_torque"
     if distance_key in data:
         distance = jnp.asarray(data[distance_key], dtype=jnp.float32)
     else:
         distance = jnp.asarray(data[f"{prefix}_total"], dtype=jnp.float32)
+    zeros = jnp.zeros_like(distance)
     return GraspBatchEnergy(
         total=jnp.asarray(data[f"{prefix}_total"], dtype=jnp.float32),
         distance=distance,
+        equilibrium=jnp.asarray(data[equilibrium_key], dtype=jnp.float32) if equilibrium_key in data else zeros,
+        force=jnp.asarray(data[force_key], dtype=jnp.float32) if force_key in data else zeros,
+        torque=jnp.asarray(data[torque_key], dtype=jnp.float32) if torque_key in data else zeros,
     )
 
 

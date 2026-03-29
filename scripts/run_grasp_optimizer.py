@@ -26,23 +26,19 @@ from grasp_gen.grasp_profiler import (
 )
 from grasp_gen.hand import Hand, InitConfig
 from grasp_gen.hand_contacts import ContactConfig
-from grasp_gen.mesh_primitives import cylinder_mesh
 from grasp_gen.prop import Prop
+from grasp_gen.prop_assets import make_named_prop
 
 
-CYLINDER_RADIUS = 0.045
-CYLINDER_HALF_HEIGHT = 0.165
-CYLINDER_SIDES = 32
-CYLINDER_POS = np.zeros(3, dtype=float)
+CUBE_SIZE = 0.07
 
 
-def _make_prop() -> Prop:
-    vertices, faces = cylinder_mesh(CYLINDER_RADIUS, CYLINDER_HALF_HEIGHT, sides=CYLINDER_SIDES)
-    return Prop(vertices, faces, pos=CYLINDER_POS.copy(), name="cylinder")
+def _make_prop(args: argparse.Namespace) -> tuple[Prop, dict[str, object]]:
+    return make_named_prop(args.object, cube_size=float(args.cube_size))
 
 
-def _default_output_path(batch: int, steps: int, seed: int) -> Path:
-    return ROOT / "outputs" / "grasp_optimizer" / f"run_b{batch}_s{steps}_seed{seed}.npz"
+def _default_output_path(batch: int, steps: int, seed: int, equilibrium_mode: str, object_kind: str) -> Path:
+    return ROOT / "outputs" / "grasp_optimizer" / f"run_{object_kind}_b{batch}_s{steps}_seed{seed}_eq{equilibrium_mode}.npz"
 
 
 def _result_stats(state) -> dict[str, float | int]:
@@ -56,6 +52,12 @@ def _result_stats(state) -> dict[str, float | int]:
         "current_energy_mean": float(np.mean(current)),
         "best_energy_min": float(np.min(best)),
         "best_energy_mean": float(np.mean(best)),
+        "best_equilibrium_min": float(np.min(np.asarray(state.best_energy.equilibrium, dtype=float))),
+        "best_equilibrium_mean": float(np.mean(np.asarray(state.best_energy.equilibrium, dtype=float))),
+        "best_force_min": float(np.min(np.asarray(state.best_energy.force, dtype=float))),
+        "best_force_mean": float(np.mean(np.asarray(state.best_energy.force, dtype=float))),
+        "best_torque_min": float(np.min(np.asarray(state.best_energy.torque, dtype=float))),
+        "best_torque_mean": float(np.mean(np.asarray(state.best_energy.torque, dtype=float))),
         "best_sample_index": int(np.argmin(best)),
         "accepted_steps_mean": float(np.mean(accepted)),
         "rejected_steps_mean": float(np.mean(rejected)),
@@ -65,6 +67,8 @@ def _result_stats(state) -> dict[str, float | int]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the batched grasp optimizer and save the result to disk.")
     parser.add_argument("--hand", choices=("right", "left"), default="right")
+    parser.add_argument("--object", choices=("cylinder", "cube", "drill"), default="cylinder")
+    parser.add_argument("--cube-size", type=float, default=CUBE_SIZE, help="Cube edge length when --object cube.")
     parser.add_argument("--batch", "--envs", dest="batch", type=int, default=64, help="Number of optimizer environments.")
     parser.add_argument("--steps", type=int, default=5000, help="Number of optimizer steps to run.")
     parser.add_argument("--points", type=int, default=6, help="Contact candidates per segment.")
@@ -72,6 +76,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--offset", type=float, default=0.30, help="Initial target-to-palm distance.")
     parser.add_argument("--distance-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--equilibrium",
+        choices=("none", "torque", "simple", "wrench"),
+        default="none",
+        help="Equilibrium energy mode.",
+    )
+    parser.add_argument("--equilibrium-weight", type=float, default=1.0)
+    parser.add_argument("--wrench-iters", type=int, default=24, help="Projected-gradient iterations for wrench mode.")
     parser.add_argument("--bench-steps", type=int, default=256, help="Extra compiled-loop steps for steady-state timing. Set 0 to disable.")
     parser.add_argument("--output", type=Path, default=None, help="Result .npz path. Defaults to outputs/grasp_optimizer/...")
     return parser.parse_args()
@@ -81,6 +93,8 @@ def main() -> None:
     args = parse_args()
     if args.batch <= 0:
         raise SystemExit("--batch must be positive.")
+    if args.cube_size <= 0.0:
+        raise SystemExit("--cube-size must be positive.")
     if args.steps < 0:
         raise SystemExit("--steps must be non-negative.")
     if args.points <= 0:
@@ -91,14 +105,22 @@ def main() -> None:
         raise SystemExit("--bench-steps must be non-negative.")
     if args.offset <= 0.0:
         raise SystemExit("--offset must be positive.")
+    if args.equilibrium_weight < 0.0:
+        raise SystemExit("--equilibrium-weight must be non-negative.")
+    if args.wrench_iters <= 0:
+        raise SystemExit("--wrench-iters must be positive.")
 
-    output_path = _default_output_path(args.batch, args.steps, args.seed) if args.output is None else args.output.resolve()
+    output_path = (
+        _default_output_path(args.batch, args.steps, args.seed, args.equilibrium, args.object)
+        if args.output is None
+        else args.output.resolve()
+    )
     profiler = RunProfiler()
 
     with profiler.section("build.hand"):
         hand = Hand(args.hand)
     with profiler.section("build.prop"):
-        prop = _make_prop()
+        prop, prop_meta = _make_prop(args)
 
     init_cfg = InitConfig(n_per_seg=args.points, palm_offset=args.offset)
     contact_cfg = ContactConfig(
@@ -108,6 +130,9 @@ def main() -> None:
     )
     energy_cfg = GraspEnergyConfig(
         distance_weight=args.distance_weight,
+        equilibrium_mode=args.equilibrium,
+        equilibrium_weight=args.equilibrium_weight,
+        wrench_iters=args.wrench_iters,
     )
     optimizer_cfg = GraspBatchOptimizerConfig()
 
@@ -171,13 +196,7 @@ def main() -> None:
         "energy": asdict(energy_cfg),
         "optimizer": asdict(optimizer_cfg),
         "prop": {
-            "kind": "cylinder",
-            "radius": CYLINDER_RADIUS,
-            "half_height": CYLINDER_HALF_HEIGHT,
-            "sides": CYLINDER_SIDES,
-            "pos": CYLINDER_POS.tolist(),
-            "quat": [1.0, 0.0, 0.0, 0.0],
-            "name": "cylinder",
+            **prop_meta,
         },
         "result": result_stats,
         "profile": profile_before_save,
@@ -196,8 +215,14 @@ def main() -> None:
     print(f"step count       : {args.steps}")
     print(f"contact count    : {args.contact_count}")
     print(f"candidate count  : {energy_model.point_count}")
+    print(f"object kind      : {args.object}")
+    print(f"equilibrium mode : {args.equilibrium}")
     print(f"best energy mean : {result_stats['best_energy_mean']:.6f}")
     print(f"best energy min  : {result_stats['best_energy_min']:.6f}")
+    print(f"best eq mean     : {result_stats['best_equilibrium_mean']:.6f}")
+    print(f"best eq min      : {result_stats['best_equilibrium_min']:.6f}")
+    print(f"best force mean  : {result_stats['best_force_mean']:.6f}")
+    print(f"best torque mean : {result_stats['best_torque_mean']:.6f}")
     print(f"best sample idx  : {result_stats['best_sample_index']}")
     if args.bench_steps > 0 and "optimizer.steady_bench" in profile_summary:
         steady = profile_summary["optimizer.steady_bench"]

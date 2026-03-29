@@ -31,6 +31,14 @@ def _cam(cam: mujoco.MjvCamera) -> None:
     cam.elevation = -18.0
 
 
+def _bright_bg(model: mujoco.MjModel) -> None:
+    model.vis.rgba.haze[:] = np.array([0.97, 0.97, 0.99, 1.0], dtype=float)
+    model.vis.rgba.fog[:] = np.array([0.97, 0.97, 0.99, 1.0], dtype=float)
+    model.vis.headlight.ambient[:] = np.array([0.55, 0.55, 0.55], dtype=float)
+    model.vis.headlight.diffuse[:] = np.array([0.85, 0.85, 0.85], dtype=float)
+    model.vis.headlight.specular[:] = np.array([0.15, 0.15, 0.15], dtype=float)
+
+
 def _add_marker(scene, idx: int, pos: np.ndarray, radius: float, rgba: np.ndarray) -> int:
     limit = int(getattr(scene, "maxgeom", len(scene.geoms)))
     if idx >= limit:
@@ -62,8 +70,13 @@ def _overlay(
     current: int,
     pose: Pose,
     contacts: list[ContactRecord],
+    *,
+    show_points: bool,
 ) -> None:
     scene = viewer.user_scn
+    if not show_points:
+        scene.ngeom = 0
+        return
     idx = 0
     idx = _add_marker(scene, idx, TARGET, 0.015, np.array([1.0, 0.2, 0.2, 1.0], dtype=float))
     for batch_index, palm_pos in enumerate(batch.palm_pos):
@@ -106,8 +119,12 @@ def run(
     start_index: int,
     interval: float,
     contact_cfg: ContactConfig,
+    bright_bg: bool,
+    hide_points: bool,
 ) -> None:
     model, data = hand.mj()
+    if bright_bg:
+        _bright_bg(model)
     current = int(start_index) % len(batch)
     pose = hand.apply_batch(batch, current)
     contacts = hand.contacts(cfg=contact_cfg)
@@ -124,7 +141,7 @@ def run(
                 contacts = hand.contacts(cfg=contact_cfg)
                 print(_pose_text(hand, pose, current), flush=True)
                 next_switch = now + interval
-            _overlay(viewer, batch, current, pose, contacts)
+            _overlay(viewer, batch, current, pose, contacts, show_points=not hide_points)
             viewer.sync()
             time.sleep(1.0 / 60.0)
 
@@ -138,6 +155,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--offset", type=float, default=0.30, help="Target-to-palm distance.")
     parser.add_argument("--interval", type=float, default=3.0, help="Seconds between pose switches.")
+    parser.add_argument("--hide-points", action="store_true", help="Hide all marker points drawn in the viewer overlay.")
+    parser.add_argument("--bright-bg", action="store_true", help="Use a brighter viewer background and lighting.")
     return parser.parse_args()
 
 
@@ -192,9 +211,21 @@ def main() -> None:
         print(f"  {body_name}: {count}")
     print("viewer colors  : red=target, green=batch palms, yellow=current palm, white=current root")
     print("viewer colors  : orange=thumb contact candidates, cyan=other candidates")
+    if args.bright_bg:
+        print("viewer style   : bright background enabled")
+    if args.hide_points:
+        print("viewer overlay : point markers hidden")
     print("Viewer prints the active batch index, root 6DoF (xyz+rpy), and joint values every switch.")
 
-    run(hand, batch, start_index=start_index, interval=args.interval, contact_cfg=contact_cfg)
+    run(
+        hand,
+        batch,
+        start_index=start_index,
+        interval=args.interval,
+        contact_cfg=contact_cfg,
+        bright_bg=args.bright_bg,
+        hide_points=args.hide_points,
+    )
 
 
 if __name__ == "__main__":

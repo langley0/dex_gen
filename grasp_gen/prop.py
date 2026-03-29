@@ -22,6 +22,7 @@ class Prop:
         faces: np.ndarray,
         *,
         pos: np.ndarray,
+        com_local: np.ndarray | None = None,
         quat: np.ndarray | None = None,
         name: str = "prop",
         rgba: np.ndarray | None = None,
@@ -44,6 +45,11 @@ class Prop:
         self.vertices = vertices.copy()
         self.faces = faces.copy()
         self.pos = np.asarray(pos, dtype=float).reshape(3).copy()
+        self.com_local = (
+            np.zeros(3, dtype=float)
+            if com_local is None
+            else np.asarray(com_local, dtype=float).reshape(3).copy()
+        )
         self.quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=float) if quat is None else _unit_quat(quat)
         self.name = name
         self.rgba = (

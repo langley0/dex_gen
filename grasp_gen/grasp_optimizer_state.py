@@ -9,13 +9,20 @@ import jax.numpy as jnp
 class GraspBatchEnergy(NamedTuple):
     total: jax.Array
     distance: jax.Array
+    equilibrium: jax.Array
+    force: jax.Array
+    torque: jax.Array
 
     @classmethod
     def from_total(cls, total: jax.Array) -> "GraspBatchEnergy":
         total = jnp.asarray(total, dtype=jnp.float32)
+        zeros = jnp.zeros_like(total)
         return cls(
             total=total,
             distance=total,
+            equilibrium=zeros,
+            force=zeros,
+            torque=zeros,
         )
 
     @property

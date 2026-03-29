@@ -73,6 +73,9 @@ def profile_call(
 def block_grasp_energy(energy: GraspBatchEnergy) -> GraspBatchEnergy:
     jax.block_until_ready(energy.total)
     jax.block_until_ready(energy.distance)
+    jax.block_until_ready(energy.equilibrium)
+    jax.block_until_ready(energy.force)
+    jax.block_until_ready(energy.torque)
     return energy
 
 

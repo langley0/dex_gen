@@ -16,11 +16,12 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
+from grasp_gen.grasp_energy import GraspEnergyConfig, GraspEnergyModel
 from grasp_gen.grasp_optimizer_io import load_grasp_run
 from grasp_gen.hand import Hand
 from grasp_gen.hand_contacts import ContactConfig, ContactRecord
-from grasp_gen.mesh_primitives import cylinder_mesh
 from grasp_gen.prop import Prop
+from grasp_gen.prop_assets import prop_from_metadata
 
 
 TARGET = np.zeros(3, dtype=float)
@@ -31,6 +32,9 @@ class ViewBatch(NamedTuple):
     contact_indices: np.ndarray
     energy_total: np.ndarray
     energy_distance: np.ndarray
+    energy_equilibrium: np.ndarray
+    energy_force: np.ndarray
+    energy_torque: np.ndarray
     step_index: int
 
 
@@ -44,6 +48,12 @@ class ViewSample(NamedTuple):
     contact_indices: np.ndarray
     energy_total: float
     energy_distance: float
+    energy_equilibrium: float
+    force_residual: float
+    torque_residual: float
+    sum_force: np.ndarray
+    sum_torque: np.ndarray
+    contact_weights: np.ndarray
 
 
 def _cam(cam: mujoco.MjvCamera) -> None:
@@ -51,6 +61,14 @@ def _cam(cam: mujoco.MjvCamera) -> None:
     cam.distance = 0.72
     cam.azimuth = 145.0
     cam.elevation = -18.0
+
+
+def _bright_bg(model: mujoco.MjModel) -> None:
+    model.vis.rgba.haze[:] = np.array([0.97, 0.97, 0.99, 1.0], dtype=float)
+    model.vis.rgba.fog[:] = np.array([0.97, 0.97, 0.99, 1.0], dtype=float)
+    model.vis.headlight.ambient[:] = np.array([0.55, 0.55, 0.55], dtype=float)
+    model.vis.headlight.diffuse[:] = np.array([0.85, 0.85, 0.85], dtype=float)
+    model.vis.headlight.specular[:] = np.array([0.15, 0.15, 0.15], dtype=float)
 
 
 def _add_marker(scene, idx: int, pos: np.ndarray, radius: float, rgba: np.ndarray) -> int:
@@ -144,90 +162,11 @@ def _matrix_to_rpy_deg_np(rotation: np.ndarray) -> np.ndarray:
     return np.rad2deg(np.array([roll, pitch, yaw], dtype=float))
 
 
-def _closest_point_on_triangle(point: np.ndarray, tri: np.ndarray) -> np.ndarray:
-    a, b, c = tri
-    ab = b - a
-    ac = c - a
-    ap = point - a
-    d1 = float(np.dot(ab, ap))
-    d2 = float(np.dot(ac, ap))
-    if d1 <= 0.0 and d2 <= 0.0:
-        return a.copy()
-
-    bp = point - b
-    d3 = float(np.dot(ab, bp))
-    d4 = float(np.dot(ac, bp))
-    if d3 >= 0.0 and d4 <= d3:
-        return b.copy()
-
-    vc = d1 * d4 - d3 * d2
-    if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
-        v = d1 / max(d1 - d3, 1.0e-12)
-        return a + v * ab
-
-    cp = point - c
-    d5 = float(np.dot(ab, cp))
-    d6 = float(np.dot(ac, cp))
-    if d6 >= 0.0 and d5 <= d6:
-        return c.copy()
-
-    vb = d5 * d2 - d1 * d6
-    if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
-        w = d2 / max(d2 - d6, 1.0e-12)
-        return a + w * ac
-
-    va = d3 * d6 - d5 * d4
-    if va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
-        edge = c - b
-        w = (d4 - d3) / max((d4 - d3) + (d5 - d6), 1.0e-12)
-        return b + w * edge
-
-    denom = max(va + vb + vc, 1.0e-12)
-    v = vb / denom
-    w = vc / denom
-    return a + ab * v + ac * w
-
-
-def _prop_triangles_world(prop: Prop) -> np.ndarray:
-    quat = np.asarray(prop.quat, dtype=float)
-    matrix = np.zeros(9, dtype=float)
-    mujoco.mju_quat2Mat(matrix, quat)
-    rotation = matrix.reshape(3, 3)
-    triangles_local = np.asarray(prop.vertices[prop.faces], dtype=float)
-    return prop.pos[None, None, :] + np.einsum("ij,nkj->nki", rotation, triangles_local)
-
-
-def _nearest_prop_points(triangles_world: np.ndarray, points_world: np.ndarray) -> np.ndarray:
-    nearest = np.zeros((len(points_world), 3), dtype=float)
-    for point_index, point in enumerate(np.asarray(points_world, dtype=float)):
-        best_dist2 = np.inf
-        best_point = point.copy()
-        for tri in triangles_world:
-            candidate = _closest_point_on_triangle(point, tri)
-            dist2 = float(np.sum((point - candidate) ** 2))
-            if dist2 < best_dist2:
-                best_dist2 = dist2
-                best_point = candidate
-        nearest[point_index] = best_point
-    return nearest
-
-
 def _make_prop(prop_meta: dict[str, object]) -> Prop:
-    kind = str(prop_meta.get("kind", ""))
-    if kind != "cylinder":
-        raise SystemExit(f"Unsupported prop kind in result file: {kind!r}")
-    vertices, faces = cylinder_mesh(
-        float(prop_meta["radius"]),
-        float(prop_meta["half_height"]),
-        sides=int(prop_meta["sides"]),
-    )
-    return Prop(
-        vertices,
-        faces,
-        pos=np.asarray(prop_meta["pos"], dtype=float),
-        quat=np.asarray(prop_meta["quat"], dtype=float),
-        name=str(prop_meta.get("name", "cylinder")),
-    )
+    try:
+        return prop_from_metadata(prop_meta)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _build_scene(hand: Hand, prop: Prop) -> tuple[mujoco.MjModel, mujoco.MjData, int]:
@@ -265,6 +204,9 @@ def _select_view_batch(artifact, state_name: str) -> ViewBatch:
             contact_indices=np.asarray(state.best_contact_indices, dtype=np.int32),
             energy_total=np.asarray(energy.total, dtype=np.float32),
             energy_distance=np.asarray(energy.distance, dtype=np.float32),
+            energy_equilibrium=np.asarray(energy.equilibrium, dtype=np.float32),
+            energy_force=np.asarray(energy.force, dtype=np.float32),
+            energy_torque=np.asarray(energy.torque, dtype=np.float32),
             step_index=int(np.asarray(state.step_index)),
         )
 
@@ -274,6 +216,9 @@ def _select_view_batch(artifact, state_name: str) -> ViewBatch:
         contact_indices=np.asarray(state.contact_indices, dtype=np.int32),
         energy_total=np.asarray(energy.total, dtype=np.float32),
         energy_distance=np.asarray(energy.distance, dtype=np.float32),
+        energy_equilibrium=np.asarray(energy.equilibrium, dtype=np.float32),
+        energy_force=np.asarray(energy.force, dtype=np.float32),
+        energy_torque=np.asarray(energy.torque, dtype=np.float32),
         step_index=int(np.asarray(state.step_index)),
     )
 
@@ -288,7 +233,7 @@ def _resolve_index(batch: ViewBatch, index: int) -> int:
 
 def _sample_view(
     hand: Hand,
-    prop_triangles_world: np.ndarray,
+    energy_model: GraspEnergyModel,
     batch: ViewBatch,
     sample_index: int,
     contact_cfg: ContactConfig,
@@ -303,10 +248,11 @@ def _sample_view(
     all_contacts = hand.contacts(cfg=contact_cfg)
     contact_indices = np.asarray(batch.contact_indices[sample_index], dtype=np.int32)
     selected_contacts = [all_contacts[int(index)] for index in contact_indices.tolist()]
-    nearest_points = _nearest_prop_points(
-        prop_triangles_world,
-        np.asarray([record.world_pos for record in selected_contacts], dtype=float),
+    diagnostics = energy_model.diagnostics(
+        np.asarray(batch.hand_pose[sample_index : sample_index + 1], dtype=np.float32),
+        np.asarray(batch.contact_indices[sample_index : sample_index + 1], dtype=np.int32),
     )
+    nearest_points = np.asarray(diagnostics.nearest_world_positions[0], dtype=float)
     return ViewSample(
         root_pos=root_pos,
         root_quat=root_quat,
@@ -317,17 +263,37 @@ def _sample_view(
         contact_indices=contact_indices,
         energy_total=float(batch.energy_total[sample_index]),
         energy_distance=float(batch.energy_distance[sample_index]),
+        energy_equilibrium=float(batch.energy_equilibrium[sample_index]),
+        force_residual=float(np.asarray(diagnostics.energy.force[0], dtype=float)),
+        torque_residual=float(np.asarray(diagnostics.energy.torque[0], dtype=float)),
+        sum_force=np.asarray(diagnostics.sum_force[0], dtype=float),
+        sum_torque=np.asarray(diagnostics.sum_torque[0], dtype=float),
+        contact_weights=np.asarray(diagnostics.contact_weights[0], dtype=float),
     )
 
 
-def _state_text(hand: Hand, sample: ViewSample, batch: ViewBatch, sample_index: int) -> str:
+def _state_text(
+    hand: Hand,
+    sample: ViewSample,
+    batch: ViewBatch,
+    sample_index: int,
+    *,
+    equilibrium_mode: str,
+) -> str:
     root_rpy = _matrix_to_rpy_deg_np(_ortho6d_to_matrix_np(batch.hand_pose[sample_index, 3:9]))
     lines = [
         (
             f"sample={sample_index} step={batch.step_index} "
             f"energy={sample.energy_total:.6f} "
-            f"(distance={sample.energy_distance:.6f})"
+            f"(distance={sample.energy_distance:.6f}, equilibrium={sample.energy_equilibrium:.6f})"
         ),
+        f"equilibrium    : mode={equilibrium_mode} force={sample.force_residual:.6f} torque={sample.torque_residual:.6f}",
+        (
+            "sum force/tq   : "
+            f"force=[{sample.sum_force[0]: .4f}, {sample.sum_force[1]: .4f}, {sample.sum_force[2]: .4f}] "
+            f"torque=[{sample.sum_torque[0]: .4f}, {sample.sum_torque[1]: .4f}, {sample.sum_torque[2]: .4f}]"
+        ),
+        "contact weights : " + ", ".join(f"{value:.3f}" for value in sample.contact_weights.tolist()),
         (
             "root 6dof      : "
             f"xyz=[{sample.root_pos[0]: .4f}, {sample.root_pos[1]: .4f}, {sample.root_pos[2]: .4f}] "
@@ -345,8 +311,11 @@ def _state_text(hand: Hand, sample: ViewSample, batch: ViewBatch, sample_index: 
     return "\n".join(lines)
 
 
-def _overlay(viewer, sample: ViewSample, *, show_all: bool) -> None:
+def _overlay(viewer, sample: ViewSample, *, show_all: bool, show_points: bool) -> None:
     scene = viewer.user_scn
+    if not show_points:
+        scene.ngeom = 0
+        return
     idx = 0
     idx = _add_marker(scene, idx, TARGET, 0.015, np.array([1.0, 0.2, 0.2, 1.0], dtype=float))
     idx = _add_marker(scene, idx, sample.root_pos, 0.006, np.array([1.0, 1.0, 1.0, 1.0], dtype=float))
@@ -366,6 +335,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--state", choices=("best", "current"), default="best", help="Which saved state to render.")
     parser.add_argument("--index", type=int, default=-1, help="Batch sample index. Use -1 to pick the lowest-energy sample.")
     parser.add_argument("--show-all", action="store_true", help="Overlay all candidate hand contact points.")
+    parser.add_argument("--hide-points", action="store_true", help="Hide all marker points drawn in the viewer overlay.")
+    parser.add_argument("--bright-bg", action="store_true", help="Use a brighter viewer background and lighting.")
     return parser.parse_args()
 
 
@@ -377,7 +348,6 @@ def main() -> None:
     hand_side = str(metadata["hand"]["side"])
     hand = Hand(hand_side)
     prop = _make_prop(metadata["prop"])
-    prop_triangles_world = _prop_triangles_world(prop)
     batch = _select_view_batch(artifact, args.state)
     sample_index = _resolve_index(batch, args.index)
 
@@ -387,9 +357,21 @@ def main() -> None:
         thumb_weight=float(contact_meta["thumb_weight"]),
         palm_clearance=float(contact_meta["palm_clearance"]),
     )
+    energy_meta = metadata.get("energy", {})
+    energy_cfg = GraspEnergyConfig(
+        distance_weight=float(energy_meta.get("distance_weight", 1.0)),
+        equilibrium_mode=str(energy_meta.get("equilibrium_mode", "none")),
+        equilibrium_weight=float(energy_meta.get("equilibrium_weight", 0.0)),
+        wrench_iters=int(energy_meta.get("wrench_iters", 24)),
+        root_position_margin=float(energy_meta.get("root_position_margin", 0.35)),
+        root_height_floor=float(energy_meta.get("root_height_floor", 0.03)),
+    )
+    energy_model = GraspEnergyModel(hand, prop, contact_cfg=contact_cfg, config=energy_cfg)
 
     model, data, root_body_id = _build_scene(hand, prop)
-    sample = _sample_view(hand, prop_triangles_world, batch, sample_index, contact_cfg)
+    if args.bright_bg:
+        _bright_bg(model)
+    sample = _sample_view(hand, energy_model, batch, sample_index, contact_cfg)
     _apply_pose_to_scene(model, data, root_body_id, sample.root_pos, sample.root_quat, sample.qpos)
 
     run_meta = metadata["run"]
@@ -399,19 +381,26 @@ def main() -> None:
     print(f"jax backend      : {run_meta.get('backend', 'unknown')}")
     print(f"saved step count : {run_meta.get('steps', 'unknown')}")
     print(f"batch size       : {run_meta.get('batch', 'unknown')}")
+    print(f"object kind      : {metadata['prop'].get('kind', 'unknown')}")
     print(f"view state       : {args.state}")
     print(f"sample index     : {sample_index}")
+    print(f"equilibrium mode : {energy_cfg.equilibrium_mode}")
     if "best_sample_index" in result_meta:
         print(f"best sample idx  : {result_meta['best_sample_index']}")
-    print("viewer colors    : red=target/prop center, white=root, orange=selected hand contacts, green=nearest prop points")
-    if args.show_all:
+    if not args.hide_points:
+        print("viewer colors    : red=target/prop center, white=root, orange=selected hand contacts, green=nearest prop points")
+    if args.show_all and not args.hide_points:
         print("viewer colors    : cyan=all candidate hand contacts")
-    print(_state_text(hand, sample, batch, sample_index), flush=True)
+    if args.bright_bg:
+        print("viewer style     : bright background enabled")
+    if args.hide_points:
+        print("viewer overlay   : point markers hidden")
+    print(_state_text(hand, sample, batch, sample_index, equilibrium_mode=energy_cfg.equilibrium_mode), flush=True)
 
     with mujoco.viewer.launch_passive(model, data) as viewer:
         _cam(viewer.cam)
         while viewer.is_running():
-            _overlay(viewer, sample, show_all=args.show_all)
+            _overlay(viewer, sample, show_all=args.show_all, show_points=not args.hide_points)
             viewer.sync()
             time.sleep(1.0 / 60.0)
 

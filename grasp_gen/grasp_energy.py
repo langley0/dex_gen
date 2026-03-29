@@ -11,6 +11,16 @@ import numpy as np
 from .hand import Hand, InitConfig
 from .hand_contacts import ContactConfig
 from .prop import Prop
+from .grasp_equilibrium import (
+    EquilibriumTerms,
+    mesh_scale_np,
+    simple_terms,
+    torque_terms,
+    triangle_normals_local_np,
+    validate_mode,
+    wrench_terms,
+    zero_terms,
+)
 from .grasp_optimizer_state import GraspBatchEnergy
 
 
@@ -32,13 +42,28 @@ class HandEnergySpec(NamedTuple):
 
 class PropMeshSpec(NamedTuple):
     triangles_local: jax.Array
-    center_world: jax.Array
+    triangle_normals_local: jax.Array
+    origin_world: jax.Array
+    com_world: jax.Array
     rotation_world: jax.Array
+    scale: jax.Array
+
+
+class GraspBatchDiagnostics(NamedTuple):
+    energy: GraspBatchEnergy
+    nearest_world_positions: jax.Array
+    nearest_world_normals: jax.Array
+    sum_force: jax.Array
+    sum_torque: jax.Array
+    contact_weights: jax.Array
 
 
 @dataclass(frozen=True)
 class GraspEnergyConfig:
     distance_weight: float = 1.0
+    equilibrium_mode: str = "none"
+    equilibrium_weight: float = 1.0
+    wrench_iters: int = 24
     root_position_margin: float = 0.35
     root_height_floor: float = 0.03
 
@@ -228,10 +253,17 @@ def _extract_hand_spec(hand: Hand, contact_cfg: ContactConfig) -> HandEnergySpec
 
 def _extract_prop_mesh(prop: Prop) -> PropMeshSpec:
     triangles_local = np.asarray(prop.vertices[prop.faces], dtype=np.float32)
+    triangle_normals_local = triangle_normals_local_np(triangles_local)
+    rotation_world = _quat_to_matrix_np(prop.quat)
+    origin_world = np.asarray(prop.pos, dtype=np.float32)
+    com_world = origin_world + rotation_world @ np.asarray(prop.com_local, dtype=np.float32)
     return PropMeshSpec(
         triangles_local=jnp.asarray(triangles_local, dtype=jnp.float32),
-        center_world=jnp.asarray(prop.pos, dtype=jnp.float32),
-        rotation_world=jnp.asarray(_quat_to_matrix_np(prop.quat), dtype=jnp.float32),
+        triangle_normals_local=jnp.asarray(triangle_normals_local, dtype=jnp.float32),
+        origin_world=jnp.asarray(origin_world, dtype=jnp.float32),
+        com_world=jnp.asarray(com_world, dtype=jnp.float32),
+        rotation_world=jnp.asarray(rotation_world, dtype=jnp.float32),
+        scale=jnp.asarray(mesh_scale_np(prop.vertices), dtype=jnp.float32),
     )
 
 
@@ -248,6 +280,11 @@ class GraspEnergyModel:
         self.prop = prop
         self.contact_cfg = ContactConfig() if contact_cfg is None else contact_cfg
         self.config = GraspEnergyConfig() if config is None else config
+        self._equilibrium_mode = validate_mode(self.config.equilibrium_mode)
+        if self.config.equilibrium_weight < 0.0:
+            raise ValueError("equilibrium_weight must be non-negative.")
+        if self.config.wrench_iters <= 0:
+            raise ValueError("wrench_iters must be positive.")
         self.hand_spec = _extract_hand_spec(hand, self.contact_cfg)
         self.prop_mesh = _extract_prop_mesh(prop)
         self.pose_dim = 9 + int(hand.model.nq)
@@ -259,7 +296,7 @@ class GraspEnergyModel:
         root_rot6d = hand_pose[:, 3:9]
         hand_qpos = hand_pose[:, 9:]
 
-        offset = root_pos - self.prop_mesh.center_world[None, :]
+        offset = root_pos - self.prop_mesh.origin_world[None, :]
         offset_norm = jnp.linalg.norm(offset, axis=1, keepdims=True)
         margin = jnp.asarray(self.config.root_position_margin, dtype=jnp.float32)
         clipped_offset = jnp.where(
@@ -267,12 +304,43 @@ class GraspEnergyModel:
             offset * (margin / jnp.maximum(offset_norm, ORTHO6D_EPS)),
             offset,
         )
-        root_pos = self.prop_mesh.center_world[None, :] + clipped_offset
+        root_pos = self.prop_mesh.origin_world[None, :] + clipped_offset
         root_pos = root_pos.at[:, 2].set(jnp.maximum(root_pos[:, 2], jnp.asarray(self.config.root_height_floor, dtype=jnp.float32)))
         hand_qpos = jnp.clip(hand_qpos, self.hand_spec.qpos_lower[None, :], self.hand_spec.qpos_upper[None, :])
         return jnp.concatenate([root_pos, root_rot6d, hand_qpos], axis=1)
 
-    def energy(self, hand_pose: jax.Array, contact_indices: jax.Array) -> GraspBatchEnergy:
+    def _equilibrium_terms(
+        self,
+        nearest_world_positions: jax.Array,
+        nearest_world_normals: jax.Array,
+    ) -> EquilibriumTerms:
+        batch_size = int(nearest_world_positions.shape[0])
+        contact_count = int(nearest_world_positions.shape[1])
+        if self._equilibrium_mode == "none":
+            return zero_terms(batch_size, contact_count, dtype=nearest_world_positions)
+        if self._equilibrium_mode == "torque":
+            return torque_terms(
+                nearest_world_positions,
+                nearest_world_normals,
+                self.prop_mesh.com_world,
+                jnp.broadcast_to(self.prop_mesh.scale, (batch_size,)),
+            )
+        if self._equilibrium_mode == "simple":
+            return simple_terms(
+                nearest_world_positions,
+                nearest_world_normals,
+                self.prop_mesh.com_world,
+                jnp.broadcast_to(self.prop_mesh.scale, (batch_size,)),
+            )
+        return wrench_terms(
+            nearest_world_positions,
+            nearest_world_normals,
+            self.prop_mesh.com_world,
+            jnp.broadcast_to(self.prop_mesh.scale, (batch_size,)),
+            iterations=self.config.wrench_iters,
+        )
+
+    def diagnostics(self, hand_pose: jax.Array, contact_indices: jax.Array) -> GraspBatchDiagnostics:
         hand_pose = jnp.asarray(hand_pose, dtype=jnp.float32)
         body_positions, body_rotations = _forward_kinematics_batch(self.hand_spec, hand_pose)
         contact_world_positions = _body_local_points_to_world(
@@ -285,12 +353,42 @@ class GraspEnergyModel:
         selected_world_positions = contact_world_positions[batch_indices, contact_indices]
         selected_local_positions = jnp.einsum(
             "bkj,jm->bkm",
-            selected_world_positions - self.prop_mesh.center_world[None, None, :],
+            selected_world_positions - self.prop_mesh.origin_world[None, None, :],
             self.prop_mesh.rotation_world,
         )
-        distance_to_surface, _, _ = _closest_points_on_triangles(selected_local_positions, self.prop_mesh)
-        distance_energy = jnp.asarray(self.config.distance_weight, dtype=jnp.float32) * jnp.sum(distance_to_surface, axis=1)
-        return GraspBatchEnergy(
-            total=distance_energy,
-            distance=distance_energy,
+        distance_to_surface, triangle_index, nearest_local_positions = _closest_points_on_triangles(
+            selected_local_positions,
+            self.prop_mesh,
         )
+        nearest_world_positions = self.prop_mesh.origin_world[None, None, :] + jnp.einsum(
+            "ij,bkj->bki",
+            self.prop_mesh.rotation_world,
+            nearest_local_positions,
+        )
+        nearest_local_normals = self.prop_mesh.triangle_normals_local[triangle_index]
+        nearest_world_normals = jnp.einsum(
+            "ij,bkj->bki",
+            self.prop_mesh.rotation_world,
+            nearest_local_normals,
+        )
+        distance_energy = jnp.asarray(self.config.distance_weight, dtype=jnp.float32) * jnp.sum(distance_to_surface, axis=1)
+        equilibrium_terms = self._equilibrium_terms(nearest_world_positions, nearest_world_normals)
+        equilibrium_energy = jnp.asarray(self.config.equilibrium_weight, dtype=jnp.float32) * equilibrium_terms.energy
+        energy = GraspBatchEnergy(
+            total=distance_energy + equilibrium_energy,
+            distance=distance_energy,
+            equilibrium=equilibrium_energy,
+            force=equilibrium_terms.force_residual,
+            torque=equilibrium_terms.torque_residual,
+        )
+        return GraspBatchDiagnostics(
+            energy=energy,
+            nearest_world_positions=nearest_world_positions,
+            nearest_world_normals=nearest_world_normals,
+            sum_force=equilibrium_terms.sum_force,
+            sum_torque=equilibrium_terms.sum_torque,
+            contact_weights=equilibrium_terms.contact_weights,
+        )
+
+    def energy(self, hand_pose: jax.Array, contact_indices: jax.Array) -> GraspBatchEnergy:
+        return self.diagnostics(hand_pose, contact_indices).energy
