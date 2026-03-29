@@ -9,6 +9,7 @@ import mujoco
 import numpy as np
 
 from .hand import Hand, InitConfig
+from .hand_sdf import HandSdfSpec, build_hand_sdf_spec, hand_signed_distance
 from .hand_contacts import ContactConfig
 from .prop import Prop
 from .grasp_equilibrium import (
@@ -44,6 +45,15 @@ class PropMeshSpec(NamedTuple):
     com_world: jax.Array
     rotation_world: jax.Array
     scale: jax.Array
+    surface_points_world: jax.Array
+
+
+class _PenetrationTerms(NamedTuple):
+    signed_distance: jax.Array
+    depth: jax.Array
+    count: jax.Array
+    depth_sum: jax.Array
+    max_depth: jax.Array
 
 
 class GraspBatchDiagnostics(NamedTuple):
@@ -53,11 +63,18 @@ class GraspBatchDiagnostics(NamedTuple):
     sum_force: jax.Array
     sum_torque: jax.Array
     contact_weights: jax.Array
+    surface_points_world: jax.Array
+    surface_signed_distance: jax.Array
+    penetration_depth: jax.Array
+    penetration_count: jax.Array
+    penetration_depth_sum: jax.Array
+    max_penetration_depth: jax.Array
 
 
 @dataclass(frozen=True)
 class GraspEnergyConfig:
     distance_weight: float = 1.0
+    penetration_weight: float = 100.0
     equilibrium_weight: float = 1.0
     wrench_iters: int = 24
     root_position_margin: float = 0.35
@@ -253,6 +270,10 @@ def _extract_prop_mesh(prop: Prop) -> PropMeshSpec:
     rotation_world = _quat_to_matrix_np(prop.quat)
     origin_world = np.asarray(prop.pos, dtype=np.float32)
     com_world = origin_world + rotation_world @ np.asarray(prop.com_local, dtype=np.float32)
+    if prop.surface_cloud is None:
+        raise ValueError("Prop.surface_cloud must be set before building the grasp energy model.")
+    surface_points_local = np.asarray(prop.surface_cloud.points_local, dtype=np.float32)
+    surface_points_world = origin_world[None, :] + surface_points_local @ rotation_world.T
     return PropMeshSpec(
         triangles_local=jnp.asarray(triangles_local, dtype=jnp.float32),
         triangle_normals_local=jnp.asarray(triangle_normals_local, dtype=jnp.float32),
@@ -260,6 +281,7 @@ def _extract_prop_mesh(prop: Prop) -> PropMeshSpec:
         com_world=jnp.asarray(com_world, dtype=jnp.float32),
         rotation_world=jnp.asarray(rotation_world, dtype=jnp.float32),
         scale=jnp.asarray(mesh_scale_np(prop.vertices), dtype=jnp.float32),
+        surface_points_world=jnp.asarray(surface_points_world, dtype=jnp.float32),
     )
 
 
@@ -276,11 +298,14 @@ class GraspEnergyModel:
         self.prop = prop
         self.contact_cfg = ContactConfig() if contact_cfg is None else contact_cfg
         self.config = GraspEnergyConfig() if config is None else config
+        if self.config.penetration_weight < 0.0:
+            raise ValueError("penetration_weight must be non-negative.")
         if self.config.equilibrium_weight < 0.0:
             raise ValueError("equilibrium_weight must be non-negative.")
         if self.config.wrench_iters <= 0:
             raise ValueError("wrench_iters must be positive.")
         self.hand_spec = _extract_hand_spec(hand, self.contact_cfg)
+        self.hand_sdf = build_hand_sdf_spec(hand)
         self.prop_mesh = _extract_prop_mesh(prop)
         self.pose_dim = 9 + int(hand.model.nq)
         self.point_count = int(self.hand_spec.contact_local_positions.shape[0])
@@ -321,6 +346,32 @@ class GraspEnergyModel:
             iterations=self.config.wrench_iters,
         )
 
+    def _penetration_terms(
+        self,
+        body_positions: jax.Array,
+        body_rotations: jax.Array,
+    ) -> _PenetrationTerms:
+        batch_size = int(body_positions.shape[0])
+        point_count = int(self.prop_mesh.surface_points_world.shape[0])
+        surface_points_world = jnp.broadcast_to(
+            self.prop_mesh.surface_points_world[None, :, :],
+            (batch_size, point_count, 3),
+        )
+        surface_signed_distance = hand_signed_distance(
+            self.hand_sdf,
+            body_positions,
+            body_rotations,
+            surface_points_world,
+        )
+        penetration_depth = jnp.maximum(-surface_signed_distance, 0.0)
+        return _PenetrationTerms(
+            signed_distance=surface_signed_distance,
+            depth=penetration_depth,
+            count=jnp.sum(penetration_depth > 0.0, axis=1, dtype=jnp.int32),
+            depth_sum=jnp.sum(penetration_depth, axis=1),
+            max_depth=jnp.max(penetration_depth, axis=1),
+        )
+
     def diagnostics(self, hand_pose: jax.Array, contact_indices: jax.Array) -> GraspBatchDiagnostics:
         hand_pose = jnp.asarray(hand_pose, dtype=jnp.float32)
         body_positions, body_rotations = _forward_kinematics_batch(self.hand_spec, hand_pose)
@@ -354,10 +405,13 @@ class GraspEnergyModel:
         )
         distance_energy = jnp.asarray(self.config.distance_weight, dtype=jnp.float32) * jnp.sum(distance_to_surface, axis=1)
         equilibrium_terms = self._equilibrium_terms(nearest_world_positions, nearest_world_normals)
+        penetration_terms = self._penetration_terms(body_positions, body_rotations)
+        penetration_energy = jnp.asarray(self.config.penetration_weight, dtype=jnp.float32) * penetration_terms.depth_sum
         equilibrium_energy = jnp.asarray(self.config.equilibrium_weight, dtype=jnp.float32) * equilibrium_terms.energy
         energy = GraspBatchEnergy(
-            total=distance_energy + equilibrium_energy,
+            total=distance_energy + penetration_energy + equilibrium_energy,
             distance=distance_energy,
+            penetration=penetration_energy,
             equilibrium=equilibrium_energy,
             force=equilibrium_terms.force_residual,
             torque=equilibrium_terms.torque_residual,
@@ -369,6 +423,12 @@ class GraspEnergyModel:
             sum_force=equilibrium_terms.sum_force,
             sum_torque=equilibrium_terms.sum_torque,
             contact_weights=equilibrium_terms.contact_weights,
+            surface_points_world=self.prop_mesh.surface_points_world,
+            surface_signed_distance=penetration_terms.signed_distance,
+            penetration_depth=penetration_terms.depth,
+            penetration_count=penetration_terms.count,
+            penetration_depth_sum=penetration_terms.depth_sum,
+            max_penetration_depth=penetration_terms.max_depth,
         )
 
     def energy(self, hand_pose: jax.Array, contact_indices: jax.Array) -> GraspBatchEnergy:

@@ -26,7 +26,9 @@ class GraspEnergyModelLike(Protocol):
 
 @dataclass(frozen=True)
 class GraspBatchOptimizerConfig:
-    switch_possibility: float = 0.5
+    switch_possibility: float = 0.1
+    switch_start_step: int = 250
+    switch_ramp_steps: int = 1000
     starting_temperature: float = 18.0
     temperature_decay: float = 0.95
     annealing_period: int = 30
@@ -43,6 +45,24 @@ def _seed_to_key(seed: int) -> jax.Array:
 def _scheduled_value(base: jax.Array, decay: jax.Array, period: int, step_index: jax.Array) -> jax.Array:
     power = jnp.floor_divide(step_index, period).astype(jnp.float32)
     return base * jnp.power(decay, power)
+
+
+def _scheduled_switch_probability(
+    base: jax.Array,
+    step_index: jax.Array,
+    *,
+    start_step: int,
+    ramp_steps: int,
+) -> jax.Array:
+    if ramp_steps <= 0:
+        enabled = step_index >= jnp.asarray(start_step, dtype=jnp.int32)
+        return jnp.where(enabled, base, jnp.asarray(0.0, dtype=base.dtype))
+
+    progress = (step_index.astype(base.dtype) - jnp.asarray(float(start_step), dtype=base.dtype)) / jnp.asarray(
+        float(ramp_steps),
+        dtype=base.dtype,
+    )
+    return base * jnp.clip(progress, 0.0, 1.0)
 
 
 class GraspBatchOptimizer:
@@ -159,6 +179,10 @@ class GraspBatchOptimizer:
             raise ValueError("config.temperature_decay must be in (0, 1].")
         if not 0.0 <= self.config.switch_possibility <= 1.0:
             raise ValueError("config.switch_possibility must be in [0, 1].")
+        if self.config.switch_start_step < 0:
+            raise ValueError("config.switch_start_step must be non-negative.")
+        if self.config.switch_ramp_steps < 0:
+            raise ValueError("config.switch_ramp_steps must be non-negative.")
         if not 0.0 <= self.config.mu < 1.0:
             raise ValueError("config.mu must be in [0, 1).")
         if self.config.rms_epsilon <= 0.0:
@@ -210,6 +234,8 @@ class GraspBatchOptimizer:
         rms_epsilon = jnp.asarray(self.config.rms_epsilon, dtype=jnp.float32)
         annealing_period = int(self.config.annealing_period)
         step_size_period = int(self.config.step_size_period)
+        switch_start_step = int(self.config.switch_start_step)
+        switch_ramp_steps = int(self.config.switch_ramp_steps)
 
         @jax.jit
         def step_fn(state: GraspBatchState) -> tuple[GraspBatchState, GraspBatchSnapshot]:
@@ -223,13 +249,22 @@ class GraspBatchOptimizer:
                 state.hand_pose,
                 state.contact_indices,
             )
+            gradient = jnp.nan_to_num(gradient, nan=0.0, posinf=0.0, neginf=0.0)
 
             mean_square_grad = jnp.mean(jnp.square(gradient), axis=0)
             ema_grad = mu * state.ema_grad + (1.0 - mu) * mean_square_grad
             proposed_hand_pose = current_hand_pose - step_size * gradient / (jnp.sqrt(ema_grad)[None, :] + rms_epsilon)
 
             next_rng_key, switch_key, index_key, accept_key = jax.random.split(state.rng_key, 4)
-            switch_mask = jax.random.uniform(switch_key, shape=(batch_size, self.contact_count)) < switch_possibility
+            current_switch_probability = _scheduled_switch_probability(
+                switch_possibility,
+                step_index,
+                start_step=switch_start_step,
+                ramp_steps=switch_ramp_steps,
+            )
+            switch_mask = (
+                jax.random.uniform(switch_key, shape=(batch_size, self.contact_count)) < current_switch_probability
+            )
             sampled_contact_indices = jax.random.randint(
                 index_key,
                 shape=(batch_size, self.contact_count),
@@ -240,9 +275,19 @@ class GraspBatchOptimizer:
             proposed_energy, proposed_hand_pose = self._energy_only(proposed_hand_pose, proposed_contact_indices)
 
             alpha = jax.random.uniform(accept_key, shape=(batch_size,))
-            accept = alpha < jnp.exp(
-                (current_energy.total - proposed_energy.total) / jnp.maximum(temperature, TEMPERATURE_EPS)
+            proposed_finite = (
+                jnp.all(jnp.isfinite(proposed_hand_pose), axis=1)
+                & jnp.isfinite(proposed_energy.total)
+                & jnp.isfinite(proposed_energy.distance)
+                & jnp.isfinite(proposed_energy.penetration)
+                & jnp.isfinite(proposed_energy.equilibrium)
+                & jnp.isfinite(proposed_energy.force)
+                & jnp.isfinite(proposed_energy.torque)
             )
+            proposed_total = jnp.where(proposed_finite, proposed_energy.total, jnp.inf)
+            log_accept = (current_energy.total - proposed_total) / jnp.maximum(temperature, TEMPERATURE_EPS)
+            accept_probability = jnp.exp(jnp.minimum(log_accept, 0.0))
+            accept = proposed_finite & ((log_accept >= 0.0) | (alpha < accept_probability))
             accept_mask = accept[:, None]
 
             next_hand_pose = jnp.where(accept_mask, proposed_hand_pose, current_hand_pose)
@@ -250,6 +295,7 @@ class GraspBatchOptimizer:
             next_energy = GraspBatchEnergy(
                 total=jnp.where(accept, proposed_energy.total, current_energy.total),
                 distance=jnp.where(accept, proposed_energy.distance, current_energy.distance),
+                penetration=jnp.where(accept, proposed_energy.penetration, current_energy.penetration),
                 equilibrium=jnp.where(accept, proposed_energy.equilibrium, current_energy.equilibrium),
                 force=jnp.where(accept, proposed_energy.force, current_energy.force),
                 torque=jnp.where(accept, proposed_energy.torque, current_energy.torque),
@@ -261,6 +307,7 @@ class GraspBatchOptimizer:
             best_energy = GraspBatchEnergy(
                 total=jnp.where(is_new_best, next_energy.total, state.best_energy.total),
                 distance=jnp.where(is_new_best, next_energy.distance, state.best_energy.distance),
+                penetration=jnp.where(is_new_best, next_energy.penetration, state.best_energy.penetration),
                 equilibrium=jnp.where(is_new_best, next_energy.equilibrium, state.best_energy.equilibrium),
                 force=jnp.where(is_new_best, next_energy.force, state.best_energy.force),
                 torque=jnp.where(is_new_best, next_energy.torque, state.best_energy.torque),

@@ -3,6 +3,8 @@ from __future__ import annotations
 import mujoco
 import numpy as np
 
+from .prop_cloud import SurfacePointCloud
+
 
 def _unit_quat(quat: np.ndarray) -> np.ndarray:
     quat = np.asarray(quat, dtype=float).reshape(4).copy()
@@ -13,6 +15,31 @@ def _unit_quat(quat: np.ndarray) -> np.ndarray:
     if quat[0] < 0.0:
         quat *= -1.0
     return quat
+
+
+def _copy_surface_cloud(surface_cloud: SurfacePointCloud) -> SurfacePointCloud:
+    points_local = np.asarray(surface_cloud.points_local, dtype=np.float32)
+    normals_local = np.asarray(surface_cloud.normals_local, dtype=np.float32)
+    area_weights = np.asarray(surface_cloud.area_weights, dtype=np.float32)
+    if points_local.ndim != 2 or points_local.shape[1] != 3:
+        raise ValueError(f"surface_cloud.points_local must have shape (N, 3), got {points_local.shape}")
+    if normals_local.shape != points_local.shape:
+        raise ValueError(
+            "surface_cloud.normals_local must match surface_cloud.points_local shape, "
+            f"got {normals_local.shape} vs {points_local.shape}"
+        )
+    if area_weights.shape != (len(points_local),):
+        raise ValueError(
+            "surface_cloud.area_weights must have shape (N,), "
+            f"got {area_weights.shape} for N={len(points_local)}"
+        )
+    return SurfacePointCloud(
+        points_local=points_local.copy(),
+        normals_local=normals_local.copy(),
+        area_weights=area_weights.copy(),
+        spacing=float(surface_cloud.spacing),
+        surface_area=float(surface_cloud.surface_area),
+    )
 
 
 class Prop:
@@ -28,6 +55,7 @@ class Prop:
         rgba: np.ndarray | None = None,
         friction: np.ndarray | None = None,
         condim: int = 4,
+        surface_cloud: SurfacePointCloud | None = None,
     ):
         vertices = np.asarray(vertices, dtype=float)
         faces = np.asarray(faces, dtype=np.int32)
@@ -63,6 +91,7 @@ class Prop:
             else np.asarray(friction, dtype=float).reshape(3).copy()
         )
         self.condim = int(condim)
+        self.surface_cloud = None if surface_cloud is None else _copy_surface_cloud(surface_cloud)
 
     def add_to(
         self,

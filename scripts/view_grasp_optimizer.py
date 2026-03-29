@@ -32,6 +32,7 @@ class ViewBatch(NamedTuple):
     contact_indices: np.ndarray
     energy_total: np.ndarray
     energy_distance: np.ndarray
+    energy_penetration: np.ndarray
     energy_equilibrium: np.ndarray
     energy_force: np.ndarray
     energy_torque: np.ndarray
@@ -48,12 +49,17 @@ class ViewSample(NamedTuple):
     contact_indices: np.ndarray
     energy_total: float
     energy_distance: float
+    energy_penetration: float
     energy_equilibrium: float
+    penetration_count: int
+    penetration_depth_sum: float
+    max_penetration_depth: float
     force_residual: float
     torque_residual: float
     sum_force: np.ndarray
     sum_torque: np.ndarray
     contact_weights: np.ndarray
+    penetrating_prop_points: np.ndarray
 
 
 def _cam(cam: mujoco.MjvCamera) -> None:
@@ -204,6 +210,7 @@ def _select_view_batch(artifact, state_name: str) -> ViewBatch:
             contact_indices=np.asarray(state.best_contact_indices, dtype=np.int32),
             energy_total=np.asarray(energy.total, dtype=np.float32),
             energy_distance=np.asarray(energy.distance, dtype=np.float32),
+            energy_penetration=np.asarray(energy.penetration, dtype=np.float32),
             energy_equilibrium=np.asarray(energy.equilibrium, dtype=np.float32),
             energy_force=np.asarray(energy.force, dtype=np.float32),
             energy_torque=np.asarray(energy.torque, dtype=np.float32),
@@ -216,6 +223,7 @@ def _select_view_batch(artifact, state_name: str) -> ViewBatch:
         contact_indices=np.asarray(state.contact_indices, dtype=np.int32),
         energy_total=np.asarray(energy.total, dtype=np.float32),
         energy_distance=np.asarray(energy.distance, dtype=np.float32),
+        energy_penetration=np.asarray(energy.penetration, dtype=np.float32),
         energy_equilibrium=np.asarray(energy.equilibrium, dtype=np.float32),
         energy_force=np.asarray(energy.force, dtype=np.float32),
         energy_torque=np.asarray(energy.torque, dtype=np.float32),
@@ -253,6 +261,9 @@ def _sample_view(
         np.asarray(batch.contact_indices[sample_index : sample_index + 1], dtype=np.int32),
     )
     nearest_points = np.asarray(diagnostics.nearest_world_positions[0], dtype=float)
+    penetration_depth = np.asarray(diagnostics.penetration_depth[0], dtype=float)
+    surface_points_world = np.asarray(diagnostics.surface_points_world, dtype=float)
+    penetrating_prop_points = surface_points_world[penetration_depth > 0.0]
     return ViewSample(
         root_pos=root_pos,
         root_quat=root_quat,
@@ -263,12 +274,17 @@ def _sample_view(
         contact_indices=contact_indices,
         energy_total=float(batch.energy_total[sample_index]),
         energy_distance=float(batch.energy_distance[sample_index]),
+        energy_penetration=float(batch.energy_penetration[sample_index]),
         energy_equilibrium=float(batch.energy_equilibrium[sample_index]),
+        penetration_count=int(np.asarray(diagnostics.penetration_count[0], dtype=np.int32)),
+        penetration_depth_sum=float(np.asarray(diagnostics.penetration_depth_sum[0], dtype=float)),
+        max_penetration_depth=float(np.asarray(diagnostics.max_penetration_depth[0], dtype=float)),
         force_residual=float(np.asarray(diagnostics.energy.force[0], dtype=float)),
         torque_residual=float(np.asarray(diagnostics.energy.torque[0], dtype=float)),
         sum_force=np.asarray(diagnostics.sum_force[0], dtype=float),
         sum_torque=np.asarray(diagnostics.sum_torque[0], dtype=float),
         contact_weights=np.asarray(diagnostics.contact_weights[0], dtype=float),
+        penetrating_prop_points=penetrating_prop_points,
     )
 
 
@@ -285,7 +301,13 @@ def _state_text(
         (
             f"sample={sample_index} step={batch.step_index} "
             f"energy={sample.energy_total:.6f} "
-            f"(distance={sample.energy_distance:.6f}, equilibrium={sample.energy_equilibrium:.6f})"
+            f"(distance={sample.energy_distance:.6f}, penetration={sample.energy_penetration:.6f}, equilibrium={sample.energy_equilibrium:.6f})"
+        ),
+        (
+            "penetration    : "
+            f"count={sample.penetration_count} "
+            f"depth_sum={sample.penetration_depth_sum:.6f} "
+            f"max_depth={sample.max_penetration_depth:.6f}"
         ),
         f"equilibrium    : mode={equilibrium_mode} force={sample.force_residual:.6f} torque={sample.torque_residual:.6f}",
         (
@@ -326,6 +348,8 @@ def _overlay(viewer, sample: ViewSample, *, show_all: bool, show_points: bool) -
         idx = _add_marker(scene, idx, record.world_pos, 0.007, np.array([1.0, 0.72, 0.2, 1.0], dtype=float))
     for point in sample.nearest_prop_points:
         idx = _add_marker(scene, idx, point, 0.006, np.array([0.30, 1.0, 0.40, 1.0], dtype=float))
+    for point in sample.penetrating_prop_points:
+        idx = _add_marker(scene, idx, point, 0.0045, np.array([1.0, 0.2, 0.85, 0.95], dtype=float))
     scene.ngeom = idx
 
 
@@ -361,6 +385,7 @@ def main() -> None:
     equilibrium_mode = str(energy_meta.get("equilibrium_mode", "wrench"))
     energy_cfg = GraspEnergyConfig(
         distance_weight=float(energy_meta.get("distance_weight", 1.0)),
+        penetration_weight=float(energy_meta.get("penetration_weight", 0.0)),
         equilibrium_weight=float(energy_meta.get("equilibrium_weight", 0.0)),
         wrench_iters=int(energy_meta.get("wrench_iters", 24)),
         root_position_margin=float(energy_meta.get("root_position_margin", 0.35)),
@@ -388,7 +413,7 @@ def main() -> None:
     if "best_sample_index" in result_meta:
         print(f"best sample idx  : {result_meta['best_sample_index']}")
     if not args.hide_points:
-        print("viewer colors    : red=target/prop center, white=root, orange=selected hand contacts, green=nearest prop points")
+        print("viewer colors    : red=target/prop center, white=root, orange=selected hand contacts, green=nearest prop points, magenta=penetrating prop points")
     if args.show_all and not args.hide_points:
         print("viewer colors    : cyan=all candidate hand contacts")
     if args.bright_bg:

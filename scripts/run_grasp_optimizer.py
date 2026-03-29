@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
 from grasp_gen.grasp_energy import GraspEnergyConfig, GraspEnergyModel
+from grasp_gen.grasp_collision import MuJoCoContactOracle
 from grasp_gen.grasp_optimizer import GraspBatchOptimizer, GraspBatchOptimizerConfig
 from grasp_gen.grasp_optimizer_io import save_grasp_run
 from grasp_gen.grasp_profiler import (
@@ -36,8 +37,16 @@ def _make_prop(args: argparse.Namespace) -> tuple[Prop, dict[str, object]]:
     return make_named_prop(args.object, cube_size=float(args.cube_size))
 
 
-def _default_output_path(batch: int, steps: int, seed: int, object_kind: str) -> Path:
-    return ROOT / "outputs" / "grasp_optimizer" / f"run_{object_kind}_b{batch}_s{steps}_seed{seed}_eqwrench.npz"
+def _tag_float(value: float) -> str:
+    value = float(value)
+    if value.is_integer():
+        return str(int(value))
+    return str(value).replace(".", "p").replace("-", "m")
+
+
+def _default_output_path(batch: int, steps: int, seed: int, object_kind: str, penetration_weight: float) -> Path:
+    pen_tag = _tag_float(penetration_weight)
+    return ROOT / "outputs" / "grasp_optimizer" / f"run_{object_kind}_b{batch}_s{steps}_seed{seed}_eqwrench_pen{pen_tag}.npz"
 
 
 def _result_stats(state) -> dict[str, float | int]:
@@ -51,6 +60,8 @@ def _result_stats(state) -> dict[str, float | int]:
         "current_energy_mean": float(np.mean(current)),
         "best_energy_min": float(np.min(best)),
         "best_energy_mean": float(np.mean(best)),
+        "best_penetration_min": float(np.min(np.asarray(state.best_energy.penetration, dtype=float))),
+        "best_penetration_mean": float(np.mean(np.asarray(state.best_energy.penetration, dtype=float))),
         "best_equilibrium_min": float(np.min(np.asarray(state.best_energy.equilibrium, dtype=float))),
         "best_equilibrium_mean": float(np.mean(np.asarray(state.best_energy.equilibrium, dtype=float))),
         "best_force_min": float(np.min(np.asarray(state.best_energy.force, dtype=float))),
@@ -63,10 +74,24 @@ def _result_stats(state) -> dict[str, float | int]:
     }
 
 
+def _best_actual_contact_stats(hand: Hand, prop, state, *, penetration_weight: float) -> dict[str, float | int]:
+    oracle = MuJoCoContactOracle(hand, prop, weight=penetration_weight)
+    best = np.asarray(state.best_energy.total, dtype=float)
+    best_index = int(np.argmin(best))
+    result = oracle.evaluate(np.asarray(state.best_hand_pose[best_index], dtype=np.float32))
+    return {
+        "best_actual_contact_count": int(result.contact_count),
+        "best_actual_penetration_count": int(result.penetration_count),
+        "best_actual_depth_sum": float(result.depth_sum),
+        "best_actual_max_depth": float(result.max_depth),
+        "best_actual_penetration_energy": float(result.energy),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the batched grasp optimizer and save the result to disk.")
     parser.add_argument("--hand", choices=("right", "left"), default="right")
-    parser.add_argument("--object", choices=("cylinder", "cube", "drill"), default="cylinder")
+    parser.add_argument("--object", choices=("cylinder", "cube", "drill", "decor01"), default="cylinder")
     parser.add_argument("--cube-size", type=float, default=CUBE_SIZE, help="Cube edge length when --object cube.")
     parser.add_argument("--batch", "--envs", dest="batch", type=int, default=64, help="Number of optimizer environments.")
     parser.add_argument("--steps", type=int, default=5000, help="Number of optimizer steps to run.")
@@ -75,6 +100,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--offset", type=float, default=0.30, help="Initial target-to-palm distance.")
     parser.add_argument("--distance-weight", type=float, default=1.0)
+    parser.add_argument("--penetration-weight", type=float, default=100.0)
     parser.add_argument("--equilibrium-weight", type=float, default=1.0)
     parser.add_argument("--wrench-iters", type=int, default=24, help="Projected-gradient iterations for wrench equilibrium.")
     parser.add_argument("--bench-steps", type=int, default=256, help="Extra compiled-loop steps for steady-state timing. Set 0 to disable.")
@@ -98,13 +124,15 @@ def main() -> None:
         raise SystemExit("--bench-steps must be non-negative.")
     if args.offset <= 0.0:
         raise SystemExit("--offset must be positive.")
+    if args.penetration_weight < 0.0:
+        raise SystemExit("--penetration-weight must be non-negative.")
     if args.equilibrium_weight < 0.0:
         raise SystemExit("--equilibrium-weight must be non-negative.")
     if args.wrench_iters <= 0:
         raise SystemExit("--wrench-iters must be positive.")
 
     output_path = (
-        _default_output_path(args.batch, args.steps, args.seed, args.object)
+        _default_output_path(args.batch, args.steps, args.seed, args.object, args.penetration_weight)
         if args.output is None
         else args.output.resolve()
     )
@@ -123,6 +151,7 @@ def main() -> None:
     )
     energy_cfg = GraspEnergyConfig(
         distance_weight=args.distance_weight,
+        penetration_weight=args.penetration_weight,
         equilibrium_weight=args.equilibrium_weight,
         wrench_iters=args.wrench_iters,
     )
@@ -173,6 +202,24 @@ def main() -> None:
         )
 
     result_stats = _result_stats(state)
+    actual_contact_stats = profile_call(
+        profiler,
+        "result.actual_contact",
+        lambda: _best_actual_contact_stats(
+            hand,
+            prop,
+            state,
+            penetration_weight=args.penetration_weight,
+        ),
+    )
+    result_stats.update(actual_contact_stats)
+    guard_reasons: list[str] = []
+    if result_stats["accepted_steps_mean"] <= 0.0:
+        guard_reasons.append("accepted_steps_mean == 0")
+    if result_stats["best_actual_contact_count"] <= 0:
+        guard_reasons.append("best_actual_contact_count == 0")
+    result_stats["guard_failed"] = bool(guard_reasons)
+    result_stats["guard_reason"] = "; ".join(guard_reasons)
     profile_before_save = profiler.summary()
     metadata = {
         "hand": {"side": args.hand},
@@ -211,11 +258,19 @@ def main() -> None:
     print("equilibrium mode : wrench")
     print(f"best energy mean : {result_stats['best_energy_mean']:.6f}")
     print(f"best energy min  : {result_stats['best_energy_min']:.6f}")
+    print(f"best pen mean    : {result_stats['best_penetration_mean']:.6f}")
+    print(f"best pen min     : {result_stats['best_penetration_min']:.6f}")
     print(f"best eq mean     : {result_stats['best_equilibrium_mean']:.6f}")
     print(f"best eq min      : {result_stats['best_equilibrium_min']:.6f}")
     print(f"best force mean  : {result_stats['best_force_mean']:.6f}")
     print(f"best torque mean : {result_stats['best_torque_mean']:.6f}")
     print(f"best sample idx  : {result_stats['best_sample_index']}")
+    print(f"actual contacts  : {result_stats['best_actual_contact_count']}")
+    print(f"actual overlaps  : {result_stats['best_actual_penetration_count']}")
+    print(f"actual depth sum : {result_stats['best_actual_depth_sum']:.6f}")
+    print(f"run guard        : {'FAIL' if result_stats['guard_failed'] else 'PASS'}")
+    if result_stats["guard_reason"]:
+        print(f"guard reason     : {result_stats['guard_reason']}")
     if args.bench_steps > 0 and "optimizer.steady_bench" in profile_summary:
         steady = profile_summary["optimizer.steady_bench"]
         steps_per_s = args.bench_steps / max(float(steady["total_s"]), 1.0e-12)
@@ -225,6 +280,9 @@ def main() -> None:
         print(f"bottleneck       : {name} ({float(stats['total_s']):.3f}s total)")
     print("profile summary  :")
     print(format_profile_summary(profile_summary))
+
+    if result_stats["guard_failed"]:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

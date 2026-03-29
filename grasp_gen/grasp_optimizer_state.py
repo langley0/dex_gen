@@ -9,6 +9,7 @@ import jax.numpy as jnp
 class GraspBatchEnergy(NamedTuple):
     total: jax.Array
     distance: jax.Array
+    penetration: jax.Array
     equilibrium: jax.Array
     force: jax.Array
     torque: jax.Array
@@ -20,6 +21,7 @@ class GraspBatchEnergy(NamedTuple):
         return cls(
             total=total,
             distance=total,
+            penetration=zeros,
             equilibrium=zeros,
             force=zeros,
             torque=zeros,
