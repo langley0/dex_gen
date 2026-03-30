@@ -10,27 +10,25 @@ from .types import RefineEnergyTerms, RefineResultState
 
 
 CONTACT_LOCAL_EPS = 1.0e-8
+GRAD_ACTIVITY_EPS = 1.0e-4
 
 
 @dataclass(frozen=True)
 class RefineConfig:
     steps: int = 32
-    step_size: float = 0.01
-    beta1: float = 0.9
-    beta2: float = 0.999
-    adam_eps: float = 1.0e-8
-    penetration_weight: float = 60.0
-    contact_weight: float = 30.0
-    support_weight: float = 12.0
-    distance_weight: float = 0.1
-    equilibrium_weight: float = 0.05
-    root_reg_weight: float = 1.0
-    joint_reg_weight: float = 0.1
-    penetration_threshold: float = 5.0e-4
-    support_points_per_body: int = 6
-    support_distance_sigma: float = 1.5e-2
-    support_max_distance: float = 3.0e-2
+    guidance_scale: float = 1.0
+    grad_scale: float = 0.1
+    noise_scale_start: float = 1.0e-2
+    noise_scale_end: float = 1.0e-3
+    surface_pull_weight: float = 1.0
+    external_repulsion_weight: float = 0.3
+    self_repulsion_weight: float = 1.0
+    surface_pull_threshold: float = 2.0e-2
+    self_repulsion_threshold: float = 2.0e-2
+    external_threshold: float = 1.0e-3
+    grad_clip_norm: float = 1.0
     actual_object_density: float = 400.0
+    seed: int = 0
 
 
 @dataclass(frozen=True)
@@ -56,8 +54,57 @@ class SingleRefineCallbacks:
         [np.ndarray, np.ndarray, np.ndarray, RefineConfig],
         tuple[RefineEnergyTerms, np.ndarray, np.ndarray],
     ]
-    active_pose_mask: Callable[[np.ndarray, np.ndarray, float], np.ndarray]
+    sample_scales: Callable[[], np.ndarray]
     actual_overlap_counts: Callable[[np.ndarray], tuple[int, int, float, float]]
+
+
+def _scheduled_noise_scale(config: RefineConfig, step_index: int) -> float:
+    if int(config.steps) <= 1:
+        return float(config.noise_scale_end)
+    alpha = float(step_index) / float(max(int(config.steps) - 1, 1))
+    return float(config.noise_scale_start) + (float(config.noise_scale_end) - float(config.noise_scale_start)) * alpha
+
+
+def _active_mask_from_grad(grad: np.ndarray) -> np.ndarray:
+    grad = np.asarray(grad, dtype=np.float32)
+    return (np.abs(grad) > GRAD_ACTIVITY_EPS).astype(np.float32)
+
+
+def _guided_sampling_step(
+    current_hand_pose: np.ndarray,
+    grad_np: np.ndarray,
+    *,
+    step_scales: np.ndarray,
+    noise_scale: float,
+    rng: np.random.Generator,
+    config: RefineConfig,
+) -> np.ndarray:
+    current_hand_pose = np.asarray(current_hand_pose, dtype=np.float32)
+    grad_np = np.nan_to_num(np.asarray(grad_np, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    step_scales = np.asarray(step_scales, dtype=np.float32)
+
+    scaled_grad = grad_np * step_scales * float(config.grad_scale)
+    grad_norm = float(np.linalg.norm(scaled_grad))
+    if float(config.grad_clip_norm) > 0.0 and grad_norm > float(config.grad_clip_norm):
+        scaled_grad *= float(config.grad_clip_norm) / max(grad_norm, CONTACT_LOCAL_EPS)
+        grad_norm = float(np.linalg.norm(scaled_grad))
+
+    radius = float(np.sqrt(float(current_hand_pose.size)) * noise_scale)
+    if radius <= CONTACT_LOCAL_EPS:
+        return current_hand_pose.copy()
+
+    d_sample_norm = float(noise_scale) * rng.standard_normal(current_hand_pose.shape, dtype=np.float32)
+    if grad_norm > CONTACT_LOCAL_EPS:
+        d_star_norm = -radius * scaled_grad / grad_norm
+    else:
+        d_star_norm = np.zeros_like(current_hand_pose, dtype=np.float32)
+    mix_direction_norm = d_sample_norm + float(config.guidance_scale) * (d_star_norm - d_sample_norm)
+    mix_norm = float(np.linalg.norm(mix_direction_norm))
+    if mix_norm <= CONTACT_LOCAL_EPS:
+        return current_hand_pose.copy()
+
+    mix_step_actual = step_scales * (radius * mix_direction_norm / mix_norm)
+    return np.asarray(current_hand_pose + mix_step_actual, dtype=np.float32)
 
 
 def refine_source_grasp(
@@ -70,8 +117,10 @@ def refine_source_grasp(
     initial_hand_pose = np.asarray(source.hand_pose, dtype=np.float32)
     contact_indices = np.asarray(source.contact_indices, dtype=np.int32)
     contact_target_local = np.asarray(contact_target_local, dtype=np.float32)
+    step_scales = np.asarray(callbacks.sample_scales(), dtype=np.float32)
+    rng = np.random.default_rng(int(config.seed))
 
-    initial_energy, projected_initial_hand_pose, _ = callbacks.evaluate_terms_with_grad(
+    initial_energy, projected_initial_hand_pose, initial_grad = callbacks.evaluate_terms_with_grad(
         initial_hand_pose,
         contact_indices,
         contact_target_local,
@@ -80,9 +129,7 @@ def refine_source_grasp(
     best_hand_pose = projected_initial_hand_pose.copy()
     best_energy = initial_energy
     current_hand_pose = projected_initial_hand_pose.copy()
-
-    adam_m = np.zeros_like(current_hand_pose, dtype=np.float32)
-    adam_v = np.zeros_like(current_hand_pose, dtype=np.float32)
+    current_grad = np.asarray(initial_grad, dtype=np.float32)
 
     history_total: list[float] = [initial_energy.total]
     history_distance: list[float] = [initial_energy.distance]
@@ -91,39 +138,34 @@ def refine_source_grasp(
     history_contact: list[float] = [initial_energy.contact]
     history_root_reg: list[float] = [initial_energy.root_reg]
     history_joint_reg: list[float] = [initial_energy.joint_reg]
-    history_active_joint_count: list[int] = [
-        int(np.count_nonzero(callbacks.active_pose_mask(current_hand_pose, contact_indices, config.penetration_threshold)[9:]))
-    ]
+    history_active_joint_count: list[int] = [int(np.count_nonzero(_active_mask_from_grad(current_grad)[9:]))]
 
-    final_mask = np.ones_like(current_hand_pose, dtype=np.float32)
+    final_mask = _active_mask_from_grad(current_grad)
     for step_index in range(int(config.steps)):
-        final_mask = np.asarray(
-            callbacks.active_pose_mask(current_hand_pose, contact_indices, config.penetration_threshold),
-            dtype=np.float32,
-        )
         current_energy, projected, grad_np = callbacks.evaluate_terms_with_grad(
             current_hand_pose,
             contact_indices,
             contact_target_local,
             config,
         )
-
-        t = step_index + 1
-        grad_np = np.nan_to_num(np.asarray(grad_np, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0) * final_mask
-        adam_m = float(config.beta1) * adam_m + (1.0 - float(config.beta1)) * grad_np
-        adam_v = float(config.beta2) * adam_v + (1.0 - float(config.beta2)) * np.square(grad_np)
-        m_hat = adam_m / max(1.0 - float(config.beta1) ** t, CONTACT_LOCAL_EPS)
-        v_hat = adam_v / max(1.0 - float(config.beta2) ** t, CONTACT_LOCAL_EPS)
-        proposal = projected - float(config.step_size) * m_hat / (np.sqrt(v_hat) + float(config.adam_eps))
-        proposal = proposal * final_mask + projected * (1.0 - final_mask)
-
-        next_terms, next_projected, _ = callbacks.evaluate_terms_with_grad(
+        noise_scale = _scheduled_noise_scale(config, step_index)
+        proposal = _guided_sampling_step(
+            projected,
+            grad_np,
+            step_scales=step_scales,
+            noise_scale=noise_scale,
+            rng=rng,
+            config=config,
+        )
+        next_terms, next_projected, next_grad = callbacks.evaluate_terms_with_grad(
             np.asarray(proposal, dtype=np.float32),
             contact_indices,
             contact_target_local,
             config,
         )
         current_hand_pose = np.asarray(next_projected, dtype=np.float32)
+        current_grad = np.asarray(next_grad, dtype=np.float32)
+        final_mask = _active_mask_from_grad(current_grad)
 
         history_total.append(next_terms.total)
         history_distance.append(next_terms.distance)
@@ -162,6 +204,7 @@ def refine_source_grasp(
             "initial_total": float(initial_energy.total),
             "final_total": float(final_energy.total),
             "best_total": float(best_energy.total),
+            "method": "dexgrasp_anything_guided_sampling",
         },
     }
     state = RefineResultState(

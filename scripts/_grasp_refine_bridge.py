@@ -23,9 +23,6 @@ from grasp_refine.refine import CONTACT_LOCAL_EPS, RefineConfig, RefineEnergyTer
 from grasp_sampling.scene import build_physics_scene
 
 
-SUPPORT_GROUP_COUNT = 5
-
-
 def _contact_config_from_metadata(metadata: dict[str, Any]) -> ContactConfig:
     contact_meta = dict(metadata.get("contact", {}))
     return ContactConfig(
@@ -82,28 +79,6 @@ def _selected_contact_world_batch(hand_pose: jax.Array, contact_indices: jax.Arr
     return contact_world_positions[batch_indices, contact_indices]
 
 
-def _cloud_world_batch(hand_pose: jax.Array, energy_model: GraspEnergyModel) -> jax.Array:
-    body_positions, body_rotations = _forward_kinematics_batch(energy_model.hand_spec, hand_pose)
-    return _body_local_points_to_world(
-        body_positions,
-        body_rotations,
-        energy_model.hand_spec.cloud_body_indices,
-        energy_model.hand_spec.cloud_local_positions,
-    )
-
-
-def _body_local_points_to_world_per_sample(
-    body_positions: jax.Array,
-    body_rotations: jax.Array,
-    body_indices: jax.Array,
-    local_positions: jax.Array,
-) -> jax.Array:
-    batch_indices = jnp.arange(body_positions.shape[0], dtype=jnp.int32)[:, None]
-    selected_body_positions = body_positions[batch_indices, body_indices]
-    selected_body_rotations = body_rotations[batch_indices, body_indices]
-    return selected_body_positions + jnp.einsum("bnij,bnj->bni", selected_body_rotations, local_positions)
-
-
 def _initial_contact_targets_local_single(initial_hand_pose: np.ndarray, contact_indices: np.ndarray, energy_model: GraspEnergyModel) -> np.ndarray:
     selected_world = _selected_contact_world_single(
         jnp.asarray(initial_hand_pose, dtype=jnp.float32),
@@ -124,105 +99,6 @@ def initial_contact_targets_local_batch(hand_pose: np.ndarray, contact_indices: 
     selected_local = _object_local(selected_world, energy_model)
     _, _, nearest_local = _closest_points_on_triangles(selected_local, energy_model.prop_mesh)
     return np.asarray(nearest_local, dtype=np.float32)
-
-
-def _support_group_bodies(contact_body_indices: np.ndarray, contact_indices: np.ndarray, palm_body_index: int) -> list[int]:
-    ordered: list[int] = [int(palm_body_index)]
-    for body_index in contact_body_indices[np.asarray(contact_indices, dtype=np.int32)].tolist():
-        body_id = int(body_index)
-        if body_id not in ordered:
-            ordered.append(body_id)
-        if len(ordered) >= SUPPORT_GROUP_COUNT:
-            break
-    return ordered
-
-
-def _support_patch_single(
-    initial_hand_pose: np.ndarray,
-    contact_indices: np.ndarray,
-    energy_model: GraspEnergyModel,
-    *,
-    palm_body_index: int,
-    config: RefineConfig,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    cloud_body_indices = np.asarray(energy_model.hand_spec.cloud_body_indices, dtype=np.int32)
-    cloud_local_positions = np.asarray(energy_model.hand_spec.cloud_local_positions, dtype=np.float32)
-    cloud_world = np.asarray(
-        _cloud_world_batch(jnp.asarray(initial_hand_pose[None, :], dtype=jnp.float32), energy_model)[0],
-        dtype=np.float32,
-    )
-    cloud_local_object = np.asarray(_object_local(cloud_world[None, :, :], energy_model)[0], dtype=np.float32)
-    unsigned, _, nearest_local = _closest_points_on_triangles(
-        jnp.asarray(cloud_local_object[None, :, :], dtype=jnp.float32),
-        energy_model.prop_mesh,
-    )
-    unsigned = np.asarray(unsigned[0], dtype=np.float32)
-    nearest_local = np.asarray(nearest_local[0], dtype=np.float32)
-    sigma = max(float(config.support_distance_sigma), CONTACT_LOCAL_EPS)
-    max_distance = float(config.support_max_distance)
-    per_body = max(int(config.support_points_per_body), 1)
-    total_points = SUPPORT_GROUP_COUNT * per_body
-    support_body = np.full((total_points,), -1, dtype=np.int32)
-    support_local = np.zeros((total_points, 3), dtype=np.float32)
-    support_target = np.zeros((total_points, 3), dtype=np.float32)
-    support_weight = np.zeros((total_points,), dtype=np.float32)
-
-    contact_body_indices = np.asarray(energy_model.hand_spec.contact_body_indices, dtype=np.int32)
-    group_bodies = _support_group_bodies(contact_body_indices, contact_indices, int(palm_body_index))
-    cursor = 0
-    for body_id in group_bodies:
-        body_mask = cloud_body_indices == int(body_id)
-        if not np.any(body_mask):
-            cursor += per_body
-            continue
-        body_indices = np.flatnonzero(body_mask)
-        body_distance = unsigned[body_indices]
-        keep_mask = body_distance <= max_distance
-        if np.any(keep_mask):
-            body_indices = body_indices[keep_mask]
-            body_distance = body_distance[keep_mask]
-        order = np.argsort(body_distance, kind="stable")
-        chosen = body_indices[order[:per_body]]
-        chosen_distance = unsigned[chosen]
-        count = len(chosen)
-        if count > 0:
-            span = slice(cursor, cursor + count)
-            support_body[span] = cloud_body_indices[chosen]
-            support_local[span] = cloud_local_positions[chosen]
-            support_target[span] = nearest_local[chosen]
-            support_weight[span] = np.exp(-chosen_distance / sigma).astype(np.float32)
-        cursor += per_body
-    return support_body, support_local, support_target, support_weight
-
-
-def _support_patch_batch(
-    initial_hand_pose: np.ndarray,
-    contact_indices: np.ndarray,
-    energy_model: GraspEnergyModel,
-    *,
-    palm_body_index: int,
-    config: RefineConfig,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    batch_size = int(initial_hand_pose.shape[0])
-    per_body = max(int(config.support_points_per_body), 1)
-    total_points = SUPPORT_GROUP_COUNT * per_body
-    support_body = np.full((batch_size, total_points), -1, dtype=np.int32)
-    support_local = np.zeros((batch_size, total_points, 3), dtype=np.float32)
-    support_target = np.zeros((batch_size, total_points, 3), dtype=np.float32)
-    support_weight = np.zeros((batch_size, total_points), dtype=np.float32)
-    for batch_index in range(batch_size):
-        body, local, target, weight = _support_patch_single(
-            initial_hand_pose[batch_index],
-            contact_indices[batch_index],
-            energy_model,
-            palm_body_index=palm_body_index,
-            config=config,
-        )
-        support_body[batch_index] = body
-        support_local[batch_index] = local
-        support_target[batch_index] = target
-        support_weight[batch_index] = weight
-    return support_body, support_local, support_target, support_weight
 
 
 def select_source_grasp(artifact: GraspRunArtifact, *, state_name: str, index: int) -> SourceGrasp:
@@ -284,103 +160,31 @@ def build_runtime(metadata: dict[str, Any]) -> tuple[Hand, Any, GraspEnergyModel
     return hand, prop, energy_model
 
 
-def _ancestor_joint_masks(energy_model: GraspEnergyModel) -> np.ndarray:
-    parent_indices = np.asarray(energy_model.hand_spec.parent_indices, dtype=np.int32)
-    joint_qpos_indices = np.asarray(energy_model.hand_spec.joint_qpos_indices, dtype=np.int32)
-    qpos_count = int(energy_model.hand_spec.qpos_lower.shape[0])
-    body_count = len(parent_indices)
-    masks = np.zeros((body_count, qpos_count), dtype=np.float32)
-    for body_index in range(body_count):
-        current = int(body_index)
-        while current >= 0:
-            qpos_index = int(joint_qpos_indices[current])
-            if qpos_index >= 0:
-                masks[body_index, qpos_index] = 1.0
-            parent = int(parent_indices[current])
-            if current <= 0 or parent == current:
-                break
-            current = parent
-    return masks
+def _dga_step_scales(energy_model: GraspEnergyModel) -> np.ndarray:
+    scales = np.ones((energy_model.pose_dim,), dtype=np.float32)
+    scales[:3] = max(float(energy_model.config.root_position_margin), CONTACT_LOCAL_EPS)
+    qpos_lower = np.asarray(energy_model.hand_spec.qpos_lower, dtype=np.float32)
+    qpos_upper = np.asarray(energy_model.hand_spec.qpos_upper, dtype=np.float32)
+    scales[9:] = np.maximum(0.5 * (qpos_upper - qpos_lower), CONTACT_LOCAL_EPS)
+    return scales
 
 
-def _active_pose_mask_single(
-    hand_pose: np.ndarray,
-    contact_indices: np.ndarray,
-    energy_model: GraspEnergyModel,
-    threshold: float,
-    *,
-    support_body_indices: np.ndarray,
-    palm_body_index: int,
-) -> np.ndarray:
-    diagnostics = energy_model.diagnostics(
-        jnp.asarray(hand_pose[None, :], dtype=jnp.float32),
-        jnp.asarray(contact_indices[None, :], dtype=jnp.int32),
-    )
-    depths = np.asarray(diagnostics.penetration_depths[0], dtype=np.float32)
+def _self_repulsion_points(energy_model: GraspEnergyModel) -> tuple[np.ndarray, np.ndarray]:
+    contact_bodies = np.unique(np.asarray(energy_model.hand_spec.contact_body_indices, dtype=np.int32))
     cloud_body_indices = np.asarray(energy_model.hand_spec.cloud_body_indices, dtype=np.int32)
-    penetrated_bodies = cloud_body_indices[depths > float(threshold)]
-    support_bodies = np.asarray(support_body_indices, dtype=np.int32)
-    support_bodies = support_bodies[support_bodies >= 0]
-    bodies = np.unique(np.concatenate([penetrated_bodies, support_bodies], axis=0))
+    cloud_local_positions = np.asarray(energy_model.hand_spec.cloud_local_positions, dtype=np.float32)
 
-    parent_indices = np.asarray(energy_model.hand_spec.parent_indices, dtype=np.int32)
-    joint_qpos_indices = np.asarray(energy_model.hand_spec.joint_qpos_indices, dtype=np.int32)
-    mask = np.zeros((energy_model.pose_dim,), dtype=np.float32)
-    for body_id in bodies.tolist():
-        current = int(body_id)
-        while current >= 0:
-            qpos_index = int(joint_qpos_indices[current])
-            if qpos_index >= 0:
-                pose_index = 9 + qpos_index
-                if 0 <= pose_index < len(mask):
-                    mask[pose_index] = 1.0
-            parent = int(parent_indices[current])
-            if parent == current:
-                break
-            current = parent if current > 0 else -1
-    if np.any(penetrated_bodies == int(palm_body_index)):
-        mask[:3] = 1.0
-        mask[3:9] = 1.0
-    elif len(penetrated_bodies) == 0 and np.count_nonzero(mask[9:]) == 0 and len(support_bodies) > 0:
-        mask[:3] = 1.0
-    return mask
-
-
-def _active_pose_masks_batch(
-    hand_pose: np.ndarray,
-    contact_indices: np.ndarray,
-    energy_model: GraspEnergyModel,
-    threshold: float,
-    ancestor_joint_masks: np.ndarray,
-    *,
-    support_body_indices: np.ndarray,
-    palm_body_index: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    diagnostics = energy_model.diagnostics(
-        jnp.asarray(hand_pose, dtype=jnp.float32),
-        jnp.asarray(contact_indices, dtype=jnp.int32),
-    )
-    depths = np.asarray(diagnostics.penetration_depths, dtype=np.float32)
-    cloud_body_indices = np.asarray(energy_model.hand_spec.cloud_body_indices, dtype=np.int32)
-    batch_size = hand_pose.shape[0]
-    masks = np.zeros_like(hand_pose, dtype=np.float32)
-    active_joint_count = np.zeros((batch_size,), dtype=np.int32)
-    for batch_index in range(batch_size):
-        penetrated_bodies = cloud_body_indices[depths[batch_index] > float(threshold)]
-        support_bodies = np.asarray(support_body_indices[batch_index], dtype=np.int32)
-        support_bodies = support_bodies[support_bodies >= 0]
-        bodies = np.unique(np.concatenate([penetrated_bodies, support_bodies], axis=0))
-        if len(bodies) == 0:
+    self_body_indices: list[int] = []
+    self_local_positions: list[np.ndarray] = []
+    for body_index in contact_bodies.tolist():
+        body_points = cloud_local_positions[cloud_body_indices == int(body_index)]
+        if body_points.size == 0:
             continue
-        joint_mask = np.max(ancestor_joint_masks[bodies], axis=0)
-        masks[batch_index, 9:] = joint_mask
-        active_joint_count[batch_index] = int(np.count_nonzero(joint_mask))
-        if np.any(penetrated_bodies == int(palm_body_index)):
-            masks[batch_index, :3] = 1.0
-            masks[batch_index, 3:9] = 1.0
-        elif len(penetrated_bodies) == 0 and active_joint_count[batch_index] == 0 and len(support_bodies) > 0:
-            masks[batch_index, :3] = 1.0
-    return masks, active_joint_count
+        self_body_indices.append(int(body_index))
+        self_local_positions.append(np.mean(body_points, axis=0, dtype=np.float32))
+    if not self_body_indices:
+        raise ValueError("Unable to construct self-repulsion points from hand surface cloud.")
+    return np.asarray(self_body_indices, dtype=np.int32), np.asarray(self_local_positions, dtype=np.float32)
 
 
 def _ortho6d_to_matrix_np(ortho6d: np.ndarray) -> np.ndarray:
@@ -449,7 +253,12 @@ def _actual_overlap_counts(source: SourceGrasp, hand_pose: np.ndarray, *, densit
     return scene.contact_counts()
 
 
-def _actual_overlap_batch(metadata: dict[str, Any], hand_pose: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _actual_overlap_batch(
+    metadata: dict[str, Any],
+    hand_pose: np.ndarray,
+    *,
+    density: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     hand, prop, _ = build_runtime(metadata)
     root_pos, root_quat = _pose_root(hand_pose[0])
     scene = build_physics_scene(
@@ -460,7 +269,7 @@ def _actual_overlap_batch(metadata: dict[str, Any], hand_pose: np.ndarray) -> tu
         root_quat=root_quat,
         qpos_target=np.asarray(hand_pose[0, 9:], dtype=np.float64),
         timestep=0.005,
-        density=400.0,
+        density=density,
     )
     contact_count = np.zeros((hand_pose.shape[0],), dtype=np.int32)
     penetration_count = np.zeros((hand_pose.shape[0],), dtype=np.int32)
@@ -482,87 +291,89 @@ def _actual_overlap_batch(metadata: dict[str, Any], hand_pose: np.ndarray) -> tu
 
 
 def make_single_callbacks(source: SourceGrasp, *, metadata: dict[str, Any], config: RefineConfig) -> tuple[np.ndarray, SingleRefineCallbacks]:
-    hand, _, energy_model = build_runtime(metadata)
+    _, _, energy_model = build_runtime(metadata)
     contact_indices = np.asarray(source.contact_indices, dtype=np.int32)
     contact_target_local = _initial_contact_targets_local_single(np.asarray(source.hand_pose, dtype=np.float32), contact_indices, energy_model)
-    support_body_indices, support_local_positions, support_target_local, support_weights = _support_patch_single(
-        np.asarray(source.hand_pose, dtype=np.float32),
-        contact_indices,
-        energy_model,
-        palm_body_index=int(hand._kin.palm_body_index),
-        config=config,
-    )
-    support_body_indices_jax = jnp.asarray(np.maximum(support_body_indices, 0), dtype=jnp.int32)
-    support_local_positions_jax = jnp.asarray(support_local_positions, dtype=jnp.float32)
-    support_target_local_jax = jnp.asarray(support_target_local, dtype=jnp.float32)
-    support_weights_jax = jnp.asarray(support_weights, dtype=jnp.float32)
+
+    contact_indices_jax = jnp.asarray(contact_indices, dtype=jnp.int32)
+    cloud_body_indices = energy_model.hand_spec.cloud_body_indices
+    cloud_local_positions = energy_model.hand_spec.cloud_local_positions
+    self_body_indices_np, self_local_positions_np = _self_repulsion_points(energy_model)
+    self_body_indices = jnp.asarray(self_body_indices_np, dtype=jnp.int32)
+    self_local_positions = jnp.asarray(self_local_positions_np, dtype=jnp.float32)
+
+    surface_pull_threshold = jnp.asarray(float(config.surface_pull_threshold), dtype=jnp.float32)
+    self_repulsion_threshold = jnp.asarray(float(config.self_repulsion_threshold), dtype=jnp.float32)
+    surface_pull_weight = jnp.asarray(float(config.surface_pull_weight), dtype=jnp.float32)
+    external_repulsion_weight = jnp.asarray(float(config.external_repulsion_weight), dtype=jnp.float32)
+    self_repulsion_weight = jnp.asarray(float(config.self_repulsion_weight), dtype=jnp.float32)
+    step_scales = _dga_step_scales(energy_model)
 
     def energy_terms(hand_pose: jax.Array) -> tuple[jax.Array, tuple[jax.Array, ...]]:
         projected = energy_model.project(hand_pose[None, :])[0]
-        diagnostics = energy_model.diagnostics(projected[None, :], jnp.asarray(contact_indices[None, :], dtype=jnp.int32))
         body_positions, body_rotations = _forward_kinematics_batch(energy_model.hand_spec, projected[None, :])
-        selected_world_positions = _body_local_points_to_world(
-            body_positions,
-            body_rotations,
-            energy_model.hand_spec.contact_body_indices[jnp.asarray(contact_indices, dtype=jnp.int32)],
-            energy_model.hand_spec.contact_local_positions[jnp.asarray(contact_indices, dtype=jnp.int32)],
-        )[0]
-        selected_local_positions = _object_local(selected_world_positions, energy_model)
-        target = jnp.asarray(contact_target_local, dtype=jnp.float32)
-        contact_error = jnp.sum(jnp.square(selected_local_positions - target), axis=-1)
-        contact_term = jnp.mean(contact_error)
-        support_world_positions = _body_local_points_to_world(
-            body_positions,
-            body_rotations,
-            support_body_indices_jax,
-            support_local_positions_jax,
-        )[0]
-        support_local_current = _object_local(support_world_positions, energy_model)
-        support_error = jnp.sum(jnp.square(support_local_current - support_target_local_jax), axis=-1)
-        support_term = jnp.sum(support_weights_jax * support_error) / jnp.maximum(jnp.sum(support_weights_jax), CONTACT_LOCAL_EPS)
-        penetration_term = jnp.mean(jnp.square(diagnostics.penetration_depths[0]))
-        initial = jnp.asarray(source.hand_pose, dtype=jnp.float32)
-        root_reg = jnp.mean(jnp.square(projected[:9] - initial[:9]))
-        joint_reg = jnp.mean(jnp.square(projected[9:] - initial[9:]))
-        distance = diagnostics.energy.distance[0]
-        equilibrium = diagnostics.energy.equilibrium[0]
-        total = (
-            jnp.asarray(config.distance_weight, dtype=jnp.float32) * distance
-            + jnp.asarray(config.equilibrium_weight, dtype=jnp.float32) * equilibrium
-            + jnp.asarray(config.penetration_weight, dtype=jnp.float32) * penetration_term
-            + jnp.asarray(config.contact_weight, dtype=jnp.float32) * contact_term
-            + jnp.asarray(config.support_weight, dtype=jnp.float32) * support_term
-            + jnp.asarray(config.root_reg_weight, dtype=jnp.float32) * root_reg
-            + jnp.asarray(config.joint_reg_weight, dtype=jnp.float32) * joint_reg
+
+        contact_world = _selected_contact_world_single(projected, contact_indices_jax, energy_model)
+        contact_local = _object_local(contact_world[None, :, :], energy_model)
+        surface_distance, _, _ = _closest_points_on_triangles(contact_local, energy_model.prop_mesh)
+        surface_distance = surface_distance[0]
+        surface_close_mask = surface_distance <= surface_pull_threshold
+        surface_pull = jnp.sum(jnp.where(surface_close_mask, surface_distance, 0.0)) / (
+            jnp.sum(surface_close_mask.astype(jnp.float32)) + CONTACT_LOCAL_EPS
         )
-        return total, (distance, equilibrium, penetration_term, contact_term + support_term, root_reg, joint_reg, projected)
+
+        cloud_world = _body_local_points_to_world(
+            body_positions,
+            body_rotations,
+            cloud_body_indices,
+            cloud_local_positions,
+        )[0]
+        cloud_local = _object_local(cloud_world[None, :, :], energy_model)
+        external_unsigned, triangle_index, nearest_local = _closest_points_on_triangles(cloud_local, energy_model.prop_mesh)
+        external_unsigned = external_unsigned[0]
+        triangle_index = triangle_index[0]
+        nearest_local = nearest_local[0]
+        nearest_normals = energy_model.prop_mesh.triangle_normals_local[triangle_index]
+        signed_distance = jnp.sum((nearest_local - cloud_local[0]) * nearest_normals, axis=-1)
+        external_repulsion = jnp.max(jnp.where(signed_distance > 0.0, external_unsigned, 0.0))
+
+        self_world = _body_local_points_to_world(
+            body_positions,
+            body_rotations,
+            self_body_indices,
+            self_local_positions,
+        )[0]
+        pairwise = jnp.linalg.norm(self_world[:, None, :] - self_world[None, :, :] + 1.0e-13, axis=-1)
+        pairwise = jnp.where(jnp.eye(self_world.shape[0], dtype=bool), jnp.inf, pairwise)
+        self_repulsion = jnp.sum(jnp.maximum(self_repulsion_threshold - pairwise, 0.0))
+
+        total = (
+            surface_pull_weight * surface_pull
+            + external_repulsion_weight * external_repulsion
+            + self_repulsion_weight * self_repulsion
+        )
+        return total, (surface_pull, external_repulsion, self_repulsion, projected)
 
     grad_fn = jax.jit(jax.value_and_grad(energy_terms, argnums=0, has_aux=True))
 
     def evaluate_terms_with_grad(hand_pose: np.ndarray, contact_indices_: np.ndarray, contact_target_local_: np.ndarray, cfg: RefineConfig):
+        del contact_indices_, contact_target_local_, cfg
         ((total, aux), grad) = grad_fn(jnp.asarray(hand_pose, dtype=jnp.float32))
         projected = np.asarray(aux[-1], dtype=np.float32)
         terms = RefineEnergyTerms(
             total=float(total),
             distance=float(aux[0]),
-            equilibrium=float(aux[1]),
-            penetration=float(aux[2]),
-            contact=float(aux[3]),
-            root_reg=float(aux[4]),
-            joint_reg=float(aux[5]),
+            equilibrium=0.0,
+            penetration=float(aux[1]),
+            contact=float(aux[2]),
+            root_reg=0.0,
+            joint_reg=0.0,
         )
         return terms, projected, np.asarray(grad, dtype=np.float32)
 
     callbacks = SingleRefineCallbacks(
         evaluate_terms_with_grad=evaluate_terms_with_grad,
-        active_pose_mask=lambda hand_pose, contact_indices_, threshold: _active_pose_mask_single(
-            hand_pose,
-            contact_indices_,
-            energy_model,
-            threshold,
-            support_body_indices=support_body_indices,
-            palm_body_index=int(hand._kin.palm_body_index),
-        ),
+        sample_scales=lambda: step_scales,
         actual_overlap_counts=lambda hand_pose: _actual_overlap_counts(source, hand_pose, density=config.actual_object_density),
     )
     return contact_target_local, callbacks
@@ -575,101 +386,109 @@ def make_batch_callbacks(
     contact_indices: np.ndarray,
     config: RefineConfig,
 ) -> tuple[np.ndarray, BatchRefineCallbacks]:
-    hand, _, energy_model = build_runtime(metadata)
+    _, _, energy_model = build_runtime(metadata)
     contact_target_local = initial_contact_targets_local_batch(initial_hand_pose, contact_indices, energy_model)
-    support_body_indices, support_local_positions, support_target_local, support_weights = _support_patch_batch(
-        initial_hand_pose,
-        contact_indices,
-        energy_model,
-        palm_body_index=int(hand._kin.palm_body_index),
-        config=config,
-    )
-    ancestor_joint_masks = _ancestor_joint_masks(energy_model)
-    initial_hand_pose_jax = jnp.asarray(initial_hand_pose, dtype=jnp.float32)
+
     contact_indices_jax = jnp.asarray(contact_indices, dtype=jnp.int32)
-    support_body_indices_jax = jnp.asarray(np.maximum(support_body_indices, 0), dtype=jnp.int32)
-    support_local_positions_jax = jnp.asarray(support_local_positions, dtype=jnp.float32)
-    support_target_local_jax = jnp.asarray(support_target_local, dtype=jnp.float32)
-    support_weights_jax = jnp.asarray(support_weights, dtype=jnp.float32)
+    cloud_body_indices = energy_model.hand_spec.cloud_body_indices
+    cloud_local_positions = energy_model.hand_spec.cloud_local_positions
+    self_body_indices_np, self_local_positions_np = _self_repulsion_points(energy_model)
+    self_body_indices = jnp.asarray(self_body_indices_np, dtype=jnp.int32)
+    self_local_positions = jnp.asarray(self_local_positions_np, dtype=jnp.float32)
 
-    def energy_fn(hand_pose: jax.Array) -> tuple[jax.Array, tuple[jax.Array, ...]]:
-        projected = energy_model.project(hand_pose)
-        diagnostics = energy_model.diagnostics(projected, contact_indices_jax)
-        body_positions, body_rotations = _forward_kinematics_batch(energy_model.hand_spec, projected)
-        selected_world = _body_local_points_to_world_per_sample(
+    surface_pull_threshold = jnp.asarray(float(config.surface_pull_threshold), dtype=jnp.float32)
+    self_repulsion_threshold = jnp.asarray(float(config.self_repulsion_threshold), dtype=jnp.float32)
+    surface_pull_weight = jnp.asarray(float(config.surface_pull_weight), dtype=jnp.float32)
+    external_repulsion_weight = jnp.asarray(float(config.external_repulsion_weight), dtype=jnp.float32)
+    self_repulsion_weight = jnp.asarray(float(config.self_repulsion_weight), dtype=jnp.float32)
+    step_scales = _dga_step_scales(energy_model)
+
+    def single_energy_fn(hand_pose: jax.Array, sample_contact_indices: jax.Array) -> tuple[jax.Array, tuple[jax.Array, ...]]:
+        projected = energy_model.project(hand_pose[None, :])[0]
+        body_positions, body_rotations = _forward_kinematics_batch(energy_model.hand_spec, projected[None, :])
+
+        contact_world = _selected_contact_world_single(projected, sample_contact_indices, energy_model)
+        contact_local = _object_local(contact_world[None, :, :], energy_model)
+        surface_distance, _, _ = _closest_points_on_triangles(contact_local, energy_model.prop_mesh)
+        surface_distance = surface_distance[0]
+        surface_close_mask = surface_distance <= surface_pull_threshold
+        surface_pull = jnp.sum(jnp.where(surface_close_mask, surface_distance, 0.0)) / (
+            jnp.sum(surface_close_mask.astype(jnp.float32)) + CONTACT_LOCAL_EPS
+        )
+
+        cloud_world = _body_local_points_to_world(
             body_positions,
             body_rotations,
-            energy_model.hand_spec.contact_body_indices[contact_indices_jax],
-            energy_model.hand_spec.contact_local_positions[contact_indices_jax],
-        )
-        selected_local = _object_local(selected_world, energy_model)
-        target = jnp.asarray(contact_target_local, dtype=jnp.float32)
-        contact_term = jnp.mean(jnp.sum(jnp.square(selected_local - target), axis=-1), axis=1)
-        support_world = _body_local_points_to_world_per_sample(
+            cloud_body_indices,
+            cloud_local_positions,
+        )[0]
+        cloud_local = _object_local(cloud_world[None, :, :], energy_model)
+        external_unsigned, triangle_index, nearest_local = _closest_points_on_triangles(cloud_local, energy_model.prop_mesh)
+        external_unsigned = external_unsigned[0]
+        triangle_index = triangle_index[0]
+        nearest_local = nearest_local[0]
+        nearest_normals = energy_model.prop_mesh.triangle_normals_local[triangle_index]
+        signed_distance = jnp.sum((nearest_local - cloud_local[0]) * nearest_normals, axis=-1)
+        external_repulsion = jnp.max(jnp.where(signed_distance > 0.0, external_unsigned, 0.0))
+
+        self_world = _body_local_points_to_world(
             body_positions,
             body_rotations,
-            support_body_indices_jax,
-            support_local_positions_jax,
-        )
-        support_local_current = _object_local(support_world, energy_model)
-        support_error = jnp.sum(jnp.square(support_local_current - support_target_local_jax), axis=-1)
-        support_term = jnp.sum(support_weights_jax * support_error, axis=1) / jnp.maximum(
-            jnp.sum(support_weights_jax, axis=1),
-            CONTACT_LOCAL_EPS,
-        )
-        penetration_term = jnp.mean(jnp.square(diagnostics.penetration_depths), axis=1)
-        root_reg = jnp.mean(jnp.square(projected[:, :9] - initial_hand_pose_jax[:, :9]), axis=1)
-        joint_reg = jnp.mean(jnp.square(projected[:, 9:] - initial_hand_pose_jax[:, 9:]), axis=1)
-        distance = diagnostics.energy.distance
-        equilibrium = diagnostics.energy.equilibrium
+            self_body_indices,
+            self_local_positions,
+        )[0]
+        pairwise = jnp.linalg.norm(self_world[:, None, :] - self_world[None, :, :] + 1.0e-13, axis=-1)
+        pairwise = jnp.where(jnp.eye(self_world.shape[0], dtype=bool), jnp.inf, pairwise)
+        self_repulsion = jnp.sum(jnp.maximum(self_repulsion_threshold - pairwise, 0.0))
+
         total = (
-            jnp.asarray(config.distance_weight, dtype=jnp.float32) * distance
-            + jnp.asarray(config.equilibrium_weight, dtype=jnp.float32) * equilibrium
-            + jnp.asarray(config.penetration_weight, dtype=jnp.float32) * penetration_term
-            + jnp.asarray(config.contact_weight, dtype=jnp.float32) * contact_term
-            + jnp.asarray(config.support_weight, dtype=jnp.float32) * support_term
-            + jnp.asarray(config.root_reg_weight, dtype=jnp.float32) * root_reg
-            + jnp.asarray(config.joint_reg_weight, dtype=jnp.float32) * joint_reg
+            surface_pull_weight * surface_pull
+            + external_repulsion_weight * external_repulsion
+            + self_repulsion_weight * self_repulsion
         )
-        return jnp.sum(total), (
-            total,
-            distance,
-            equilibrium,
-            penetration_term,
-            contact_term + support_term,
-            root_reg,
-            joint_reg,
-            projected,
-        )
+        return total, (surface_pull, external_repulsion, self_repulsion, projected)
 
-    grad_fn = jax.jit(jax.value_and_grad(energy_fn, argnums=0, has_aux=True))
+    grad_fn = jax.jit(jax.value_and_grad(single_energy_fn, argnums=0, has_aux=True))
 
     def evaluate_terms_with_grad(hand_pose: np.ndarray, contact_indices_: np.ndarray, contact_target_local_: np.ndarray, cfg: RefineConfig):
-        ((_, aux), grad) = grad_fn(jnp.asarray(hand_pose, dtype=jnp.float32))
-        projected = np.asarray(aux[-1], dtype=np.float32)
+        del contact_target_local_, cfg
+        batch_size = int(hand_pose.shape[0])
+        total = np.zeros((batch_size,), dtype=np.float32)
+        distance = np.zeros((batch_size,), dtype=np.float32)
+        penetration = np.zeros((batch_size,), dtype=np.float32)
+        contact = np.zeros((batch_size,), dtype=np.float32)
+        projected = np.zeros_like(hand_pose, dtype=np.float32)
+        grad = np.zeros_like(hand_pose, dtype=np.float32)
+        for batch_index in range(batch_size):
+            ((sample_total, aux), sample_grad) = grad_fn(
+                jnp.asarray(hand_pose[batch_index], dtype=jnp.float32),
+                jnp.asarray(contact_indices_[batch_index], dtype=jnp.int32),
+            )
+            total[batch_index] = float(sample_total)
+            distance[batch_index] = float(aux[0])
+            penetration[batch_index] = float(aux[1])
+            contact[batch_index] = float(aux[2])
+            projected[batch_index] = np.asarray(aux[3], dtype=np.float32)
+            grad[batch_index] = np.asarray(sample_grad, dtype=np.float32)
         terms = {
-            "total": np.asarray(aux[0], dtype=np.float32),
-            "distance": np.asarray(aux[1], dtype=np.float32),
-            "equilibrium": np.asarray(aux[2], dtype=np.float32),
-            "penetration": np.asarray(aux[3], dtype=np.float32),
-            "contact": np.asarray(aux[4], dtype=np.float32),
-            "root_reg": np.asarray(aux[5], dtype=np.float32),
-            "joint_reg": np.asarray(aux[6], dtype=np.float32),
+            "total": total,
+            "distance": distance,
+            "equilibrium": np.zeros_like(total),
+            "penetration": penetration,
+            "contact": contact,
+            "root_reg": np.zeros_like(total),
+            "joint_reg": np.zeros_like(total),
         }
-        return terms, projected, np.asarray(grad, dtype=np.float32)
+        return terms, projected, grad
 
     callbacks = BatchRefineCallbacks(
         evaluate_terms_with_grad=evaluate_terms_with_grad,
-        active_pose_masks=lambda hand_pose, contact_indices_, threshold: _active_pose_masks_batch(
+        sample_scales=lambda: step_scales,
+        actual_overlap_batch=lambda hand_pose: _actual_overlap_batch(
+            metadata,
             hand_pose,
-            contact_indices_,
-            energy_model,
-            threshold,
-            ancestor_joint_masks,
-            support_body_indices=support_body_indices,
-            palm_body_index=int(hand._kin.palm_body_index),
+            density=config.actual_object_density,
         ),
-        actual_overlap_batch=lambda hand_pose: _actual_overlap_batch(metadata, hand_pose),
     )
     return contact_target_local, callbacks
 

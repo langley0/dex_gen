@@ -21,22 +21,23 @@ def _default_output_path(result_path: Path, state_name: str) -> Path:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run batch grasp refinement on all samples from a grasp_gen result.")
+    parser = argparse.ArgumentParser(description="Run DexGrasp Anything-style batch grasp refinement.")
     parser.add_argument("--result", type=Path, required=True)
     parser.add_argument("--state", choices=("best", "current"), default="best")
     parser.add_argument("--steps", type=int, default=16)
-    parser.add_argument("--step-size", type=float, default=0.01)
-    parser.add_argument("--penetration-weight", type=float, default=60.0)
-    parser.add_argument("--contact-weight", type=float, default=30.0)
-    parser.add_argument("--support-weight", type=float, default=12.0)
-    parser.add_argument("--distance-weight", type=float, default=0.1)
-    parser.add_argument("--equilibrium-weight", type=float, default=0.05)
-    parser.add_argument("--root-reg-weight", type=float, default=1.0)
-    parser.add_argument("--joint-reg-weight", type=float, default=0.1)
-    parser.add_argument("--penetration-threshold", type=float, default=5.0e-4)
-    parser.add_argument("--support-points-per-body", type=int, default=6)
-    parser.add_argument("--support-distance-sigma", type=float, default=1.5e-2)
-    parser.add_argument("--support-max-distance", type=float, default=3.0e-2)
+    parser.add_argument("--guidance-scale", type=float, default=1.0)
+    parser.add_argument("--grad-scale", type=float, default=0.1)
+    parser.add_argument("--noise-scale-start", type=float, default=1.0e-2)
+    parser.add_argument("--noise-scale-end", type=float, default=1.0e-3)
+    parser.add_argument("--surface-pull-weight", type=float, default=1.0)
+    parser.add_argument("--external-repulsion-weight", type=float, default=0.3)
+    parser.add_argument("--self-repulsion-weight", type=float, default=1.0)
+    parser.add_argument("--surface-pull-threshold", type=float, default=2.0e-2)
+    parser.add_argument("--self-repulsion-threshold", type=float, default=2.0e-2)
+    parser.add_argument("--external-threshold", type=float, default=1.0e-3)
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument("--object-density", type=float, default=400.0)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
 
@@ -45,18 +46,19 @@ def main() -> None:
     args = parse_args()
     config = RefineConfig(
         steps=int(args.steps),
-        step_size=float(args.step_size),
-        penetration_weight=float(args.penetration_weight),
-        contact_weight=float(args.contact_weight),
-        support_weight=float(args.support_weight),
-        distance_weight=float(args.distance_weight),
-        equilibrium_weight=float(args.equilibrium_weight),
-        root_reg_weight=float(args.root_reg_weight),
-        joint_reg_weight=float(args.joint_reg_weight),
-        penetration_threshold=float(args.penetration_threshold),
-        support_points_per_body=int(args.support_points_per_body),
-        support_distance_sigma=float(args.support_distance_sigma),
-        support_max_distance=float(args.support_max_distance),
+        guidance_scale=float(args.guidance_scale),
+        grad_scale=float(args.grad_scale),
+        noise_scale_start=float(args.noise_scale_start),
+        noise_scale_end=float(args.noise_scale_end),
+        surface_pull_weight=float(args.surface_pull_weight),
+        external_repulsion_weight=float(args.external_repulsion_weight),
+        self_repulsion_weight=float(args.self_repulsion_weight),
+        surface_pull_threshold=float(args.surface_pull_threshold),
+        self_repulsion_threshold=float(args.self_repulsion_threshold),
+        external_threshold=float(args.external_threshold),
+        grad_clip_norm=float(args.grad_clip_norm),
+        actual_object_density=float(args.object_density),
+        seed=int(args.seed),
     )
     source_artifact = load_source_artifact(args.result)
     metadata, initial_hand_pose, contact_indices, source_total = select_batch_source(source_artifact, state_name=args.state)
@@ -92,15 +94,21 @@ def main() -> None:
     print(f"improved count      : {int(np.count_nonzero(improved_mask))}")
     print(f"fixed count         : {int(np.count_nonzero(fixed_mask))}")
     print(f"actual fixed count  : {int(np.count_nonzero(actual_fixed_mask))}")
-    print(f"mean initial pen    : {float(np.mean(state['initial_penetration'])):.6f}")
-    print(f"mean best pen       : {float(np.mean(state['best_penetration'])):.6f}")
+    print(f"mean initial pull   : {float(np.mean(state['initial_distance'])):.6f}")
+    print(f"mean best pull      : {float(np.mean(state['best_distance'])):.6f}")
+    print(f"mean initial ext rp : {float(np.mean(state['initial_penetration'])):.6f}")
+    print(f"mean best ext rp    : {float(np.mean(state['best_penetration'])):.6f}")
     print(f"mean init actual ds : {float(np.mean(state['initial_actual_depth_sum'])):.6f}")
     print(f"mean best actual ds : {float(np.mean(state['best_actual_depth_sum'])):.6f}")
     print(f"best fixed index    : {best_fixed_index}")
     print(f"best actual fixed   : {best_actual_fixed_index}")
     if best_fixed_index >= 0:
         print(f"best fixed total    : {float(state['best_total'][best_fixed_index]):.6f}")
-        print(f"initial pen -> best : {float(state['initial_penetration'][best_fixed_index]):.6f} -> {float(state['best_penetration'][best_fixed_index]):.6f}")
+        print(
+            "initial ext -> best : "
+            f"{float(state['initial_penetration'][best_fixed_index]):.6f} -> "
+            f"{float(state['best_penetration'][best_fixed_index]):.6f}"
+        )
     if best_actual_fixed_index >= 0:
         print(
             "init actual -> best : "
