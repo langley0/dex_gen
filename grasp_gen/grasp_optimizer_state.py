@@ -11,7 +11,6 @@ class GraspBatchEnergy(NamedTuple):
     distance: jax.Array
     penetration: jax.Array
     equilibrium: jax.Array
-    penetration: jax.Array
     force: jax.Array
     torque: jax.Array
 
@@ -24,7 +23,6 @@ class GraspBatchEnergy(NamedTuple):
             distance=total,
             penetration=zeros,
             equilibrium=zeros,
-            penetration=zeros,
             force=zeros,
             torque=zeros,
         )

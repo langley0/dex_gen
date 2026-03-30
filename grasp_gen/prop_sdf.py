@@ -29,6 +29,30 @@ class PropSDFGrid:
         return self.min_corner_local + self.voxel_size * shape
 
 
+_CUBE_OFFSETS = np.asarray(
+    [
+        [-1.0, -1.0, -1.0],
+        [1.0, -1.0, -1.0],
+        [1.0, 1.0, -1.0],
+        [-1.0, 1.0, -1.0],
+        [-1.0, -1.0, 1.0],
+        [1.0, -1.0, 1.0],
+        [1.0, 1.0, 1.0],
+        [-1.0, 1.0, 1.0],
+    ],
+    dtype=np.float32,
+)
+
+_FACE_CORNERS = (
+    ((-1, 0, 0), (0, 3, 7, 4)),
+    ((1, 0, 0), (1, 5, 6, 2)),
+    ((0, -1, 0), (0, 4, 5, 1)),
+    ((0, 1, 0), (3, 2, 6, 7)),
+    ((0, 0, -1), (0, 1, 2, 3)),
+    ((0, 0, 1), (4, 7, 6, 5)),
+)
+
+
 def _sample_triangle(triangle: np.ndarray, step: float) -> np.ndarray:
     a, b, c = triangle
     edges = (np.linalg.norm(b - a), np.linalg.norm(c - a), np.linalg.norm(c - b))
@@ -85,3 +109,42 @@ def build_prop_sdf_grid(prop: Prop, cfg: PropSDFConfig | None = None) -> PropSDF
         voxel_size=float(cfg.voxel_size),
         values=values.astype(np.float32),
     )
+
+
+def build_sdf_surface_mesh(grid: PropSDFGrid, *, level: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
+    solid = np.asarray(grid.values <= float(level), dtype=bool)
+    voxel = float(grid.voxel_size)
+    half = 0.5 * voxel
+    vertices: list[np.ndarray] = []
+    faces: list[np.ndarray] = []
+
+    nx, ny, nz = solid.shape
+    for ix, iy, iz in np.argwhere(solid):
+        center = grid.min_corner_local + voxel * np.array([ix, iy, iz], dtype=np.float32)
+        cube = center[None, :] + half * _CUBE_OFFSETS
+        for (dx, dy, dz), corner_ids in _FACE_CORNERS:
+            nx_i = ix + dx
+            ny_i = iy + dy
+            nz_i = iz + dz
+            exposed = (
+                nx_i < 0
+                or nx_i >= nx
+                or ny_i < 0
+                or ny_i >= ny
+                or nz_i < 0
+                or nz_i >= nz
+                or not solid[nx_i, ny_i, nz_i]
+            )
+            if not exposed:
+                continue
+            base = len(vertices)
+            vertices.extend(cube[list(corner_ids)])
+            faces.append(np.asarray([base + 0, base + 1, base + 2], dtype=np.int32))
+            faces.append(np.asarray([base + 0, base + 2, base + 3], dtype=np.int32))
+
+    if not vertices:
+        return (
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.int32),
+        )
+    return np.asarray(vertices, dtype=np.float32), np.asarray(faces, dtype=np.int32)

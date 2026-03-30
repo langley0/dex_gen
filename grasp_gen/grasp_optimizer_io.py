@@ -25,7 +25,6 @@ def _energy_arrays(prefix: str, energy: GraspBatchEnergy) -> dict[str, np.ndarra
         f"{prefix}_distance": np.asarray(energy.distance, dtype=np.float32),
         f"{prefix}_penetration": np.asarray(energy.penetration, dtype=np.float32),
         f"{prefix}_equilibrium": np.asarray(energy.equilibrium, dtype=np.float32),
-        f"{prefix}_penetration": np.asarray(energy.penetration, dtype=np.float32),
         f"{prefix}_force": np.asarray(energy.force, dtype=np.float32),
         f"{prefix}_torque": np.asarray(energy.torque, dtype=np.float32),
     }
@@ -35,7 +34,6 @@ def _arrays_to_energy(data: dict[str, np.ndarray], prefix: str) -> GraspBatchEne
     distance_key = f"{prefix}_distance"
     penetration_key = f"{prefix}_penetration"
     equilibrium_key = f"{prefix}_equilibrium"
-    penetration_key = f"{prefix}_penetration"
     force_key = f"{prefix}_force"
     torque_key = f"{prefix}_torque"
     if distance_key in data:
@@ -48,7 +46,6 @@ def _arrays_to_energy(data: dict[str, np.ndarray], prefix: str) -> GraspBatchEne
         distance=distance,
         penetration=jnp.asarray(data[penetration_key], dtype=jnp.float32) if penetration_key in data else zeros,
         equilibrium=jnp.asarray(data[equilibrium_key], dtype=jnp.float32) if equilibrium_key in data else zeros,
-        penetration=jnp.asarray(data[penetration_key], dtype=jnp.float32) if penetration_key in data else zeros,
         force=jnp.asarray(data[force_key], dtype=jnp.float32) if force_key in data else zeros,
         torque=jnp.asarray(data[torque_key], dtype=jnp.float32) if torque_key in data else zeros,
     )
