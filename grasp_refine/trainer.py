@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .checkpoint import load_checkpoint, save_checkpoint
+from .checkpoint import load_checkpoint, save_best_checkpoint, save_checkpoint
 from .diffusion import diffusion_loss, make_diffusion_schedule
 from .hand_points import load_dga_hand_point_spec
 from .loader import DgaBatch, iterate_dga_batches, load_saved_dga_dataset, split_dga_dataset
@@ -84,6 +84,14 @@ def _clip_grads(grads, max_norm: float):
     return jax.tree_util.tree_map(lambda value: value * scale, grads)
 
 
+def _tree_all_finite(tree) -> jax.Array:
+    leaves = jax.tree_util.tree_leaves(tree)
+    if not leaves:
+        return jnp.asarray(True)
+    finite_flags = [jnp.all(jnp.isfinite(leaf)) for leaf in leaves]
+    return jnp.all(jnp.stack(finite_flags))
+
+
 def _replicate_tree(tree, devices: tuple[JaxDevice, ...]):
     return jax.device_put_replicated(tree, devices)
 
@@ -149,8 +157,17 @@ def _build_step_functions(config: TrainingConfig, model_config: ModelConfig, nor
         (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, batch, rng_key)
         if model_config.freeze_scene_encoder:
             grads = _freeze_scene_encoder_grads(grads, model_config.architecture)
+        finite_update = _tree_all_finite(grads) & _tree_all_finite(metrics)
         grads = _clip_grads(grads, config.optimizer.grad_clip_norm)
-        next_params, next_optimizer_state = adam_update(params, grads, optimizer_state, lr=config.optimizer.lr)
+        def do_update(_):
+            return adam_update(params, grads, optimizer_state, lr=config.optimizer.lr)
+
+        def skip_update(_):
+            return params, optimizer_state
+
+        next_params, next_optimizer_state = jax.lax.cond(finite_update, do_update, skip_update, operand=None)
+        metrics = dict(metrics)
+        metrics["update_finite"] = finite_update.astype(jnp.float32)
         return next_params, next_optimizer_state, metrics
 
     def eval_step(params, batch, rng_key):
@@ -195,10 +212,21 @@ def _build_distributed_step_functions(config: TrainingConfig, model_config: Mode
         (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, batch, rng_key)
         if model_config.freeze_scene_encoder:
             grads = _freeze_scene_encoder_grads(grads, model_config.architecture)
+        finite_update = _tree_all_finite(grads) & _tree_all_finite(metrics)
         grads = jax.lax.pmean(grads, axis_name=axis_name)
         metrics = jax.lax.pmean(metrics, axis_name=axis_name)
         grads = _clip_grads(grads, config.optimizer.grad_clip_norm)
-        next_params, next_optimizer_state = adam_update(params, grads, optimizer_state, lr=config.optimizer.lr)
+        finite_update = jax.lax.pmin(finite_update.astype(jnp.int32), axis_name=axis_name).astype(jnp.bool_)
+
+        def do_update(_):
+            return adam_update(params, grads, optimizer_state, lr=config.optimizer.lr)
+
+        def skip_update(_):
+            return params, optimizer_state
+
+        next_params, next_optimizer_state = jax.lax.cond(finite_update, do_update, skip_update, operand=None)
+        metrics = dict(metrics)
+        metrics["update_finite"] = finite_update.astype(jnp.float32)
         return next_params, next_optimizer_state, metrics
 
     def eval_step(params, batch, rng_key):
@@ -274,6 +302,7 @@ def train_grasp_diffusion(config: TrainingConfig) -> TrainingResult:
 
     start_epoch = 0 if checkpoint_state is None else int(checkpoint_state.epoch) + 1
     step = 0 if checkpoint_state is None else int(checkpoint_state.step)
+    best_val_loss = float("inf")
     history: list[EpochMetrics] = []
     for epoch in range(start_epoch, config.optimizer.epochs):
         train_rows: list[tuple[int, dict[str, float]]] = []
@@ -366,6 +395,18 @@ def train_grasp_diffusion(config: TrainingConfig) -> TrainingResult:
                 save_separately=config.save_model_separately,
                 save_scene_model=config.save_scene_model,
             )
+        if config.checkpoint_dir is not None and val_metrics is not None:
+            current_val_loss = float(val_metrics.get("loss", float("inf")))
+            if np.isfinite(current_val_loss) and current_val_loss < best_val_loss:
+                best_val_loss = current_val_loss
+                save_best_checkpoint(
+                    config.checkpoint_dir,
+                    epoch=epoch,
+                    step=step,
+                    params=_unreplicate_tree(params) if distributed else params,
+                    optimizer_state=_unreplicate_tree(optimizer_state) if distributed else optimizer_state,
+                    save_scene_model=config.save_scene_model,
+                )
         if metrics_stream is not None:
             metrics_stream.write(
                 json.dumps(

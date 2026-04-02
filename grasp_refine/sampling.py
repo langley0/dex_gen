@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .checkpoint import load_checkpoint
+from .checkpoint import load_best_checkpoint, load_checkpoint
 from .diffusion import DiffusionConfig, DiffusionSchedule, _dga_full_pose, make_diffusion_schedule, predict_x0
 from .hand_points import DgaHandPointSpec, full_pose_distance_points, full_pose_key_points, full_pose_surface_points, load_dga_hand_point_spec
 from .loader import DgaBatch, LoadedDgaDataset, iterate_dga_batches, load_saved_dga_dataset
@@ -21,6 +21,9 @@ class SamplingOutput:
     samples: np.ndarray
     samples_full: np.ndarray
     trajectory: np.ndarray | None
+    candidate_scores: np.ndarray | None = None
+    selected_indices: np.ndarray | None = None
+    selected_scores: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -56,8 +59,12 @@ def _posterior_mean_variance(
     x_t: jax.Array,
     timesteps: jax.Array,
     pred_noise: jax.Array,
+    *,
+    clip_denoised: bool = True,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     pred_x0 = predict_x0(schedule, x_t, timesteps, pred_noise)
+    if clip_denoised:
+        pred_x0 = jnp.clip(pred_x0, -1.0, 1.0)
     model_mean = (
         schedule.posterior_mean_coef1[timesteps][:, None] * pred_x0
         + schedule.posterior_mean_coef2[timesteps][:, None] * x_t
@@ -90,7 +97,13 @@ def p_sample(
         training=False,
         condition_override=cond,
     )
-    model_mean, _, model_log_variance, pred_x0 = _posterior_mean_variance(schedule, x_t, timesteps, pred_noise)
+    model_mean, _, model_log_variance, pred_x0 = _posterior_mean_variance(
+        schedule,
+        x_t,
+        timesteps,
+        pred_noise,
+        clip_denoised=True,
+    )
     noise = jax.random.normal(rng_key, x_t.shape, dtype=x_t.dtype) if int(timestep) > 0 else jnp.zeros_like(x_t)
     x_prev = model_mean + jnp.exp(0.5 * model_log_variance) * noise
     return x_prev, pred_x0
@@ -116,6 +129,47 @@ def _guidance_objective_from_full_pose(
         + float(guidance_config.spf_weight) * spf_value
         + float(guidance_config.srf_weight) * srf_value
     )
+
+
+def _score_sample_candidates(
+    samples_full: np.ndarray,
+    *,
+    hand_point_spec: DgaHandPointSpec,
+    object_points: jax.Array,
+    object_normals: jax.Array,
+    guidance_config: GuidanceConfig,
+) -> np.ndarray:
+    def _single_objective(full_pose_single: jax.Array, object_points_single: jax.Array, object_normals_single: jax.Array) -> jax.Array:
+        full_pose_batch = full_pose_single[None, :]
+        object_points_batch = object_points_single[None, :, :]
+        object_normals_batch = object_normals_single[None, :, :]
+        hand_surface = full_pose_surface_points(hand_point_spec, full_pose_batch)
+        hand_distance = full_pose_distance_points(hand_point_spec, full_pose_batch)
+        hand_key = full_pose_key_points(hand_point_spec, full_pose_batch)
+        object_pcd_nor = jnp.concatenate([object_points_batch, object_normals_batch], axis=-1)
+        erf_value = erf_loss(object_pcd_nor, hand_surface)
+        spf_value = spf_loss(hand_distance, object_points_batch)
+        srf_value = srf_loss(hand_key)
+        return (
+            float(guidance_config.erf_weight) * erf_value
+            + float(guidance_config.spf_weight) * spf_value
+            + float(guidance_config.srf_weight) * srf_value
+        )
+
+    batch_size, sample_count, _ = samples_full.shape
+    flat_full = jnp.asarray(samples_full.reshape(batch_size * sample_count, -1), dtype=jnp.float32)
+    object_points_flat = jnp.repeat(object_points[:, None, :, :], sample_count, axis=1).reshape(
+        batch_size * sample_count,
+        object_points.shape[1],
+        object_points.shape[2],
+    )
+    object_normals_flat = jnp.repeat(object_normals[:, None, :, :], sample_count, axis=1).reshape(
+        batch_size * sample_count,
+        object_normals.shape[1],
+        object_normals.shape[2],
+    )
+    total = jax.vmap(_single_objective)(flat_full, object_points_flat, object_normals_flat)
+    return np.asarray(total, dtype=np.float32).reshape(batch_size, sample_count)
 
 
 def _guidance_mix_step(
@@ -197,7 +251,13 @@ def _guided_ddpm_step(
             training=False,
             condition_override=cond,
         )
-        model_mean, _, model_log_variance, pred_x0 = _posterior_mean_variance(schedule, x_current, timesteps, pred_noise)
+        model_mean, _, model_log_variance, pred_x0 = _posterior_mean_variance(
+            schedule,
+            x_current,
+            timesteps,
+            pred_noise,
+            clip_denoised=True,
+        )
         noise = jax.random.normal(rng_key, x_current.shape, dtype=x_current.dtype) if int(timestep) > 0 else jnp.zeros_like(x_current)
         x_sample = model_mean + jnp.exp(0.5 * model_log_variance) * noise
         sample_std = jnp.exp(0.5 * model_log_variance)
@@ -1002,6 +1062,7 @@ def sample(
     dpm_config: DpmSolverConfig | None = None,
     guidance_config: GuidanceConfig | None = None,
     project_to_valid_range: bool = True,
+    select_best_by_objective: bool = False,
 ) -> SamplingOutput:
     schedule = make_diffusion_schedule(diffusion_config)
     object_points = jnp.asarray(batch.object_points, dtype=jnp.float32)
@@ -1053,6 +1114,14 @@ def sample(
     if project_to_valid_range:
         samples_denorm = dataset.normalizer.project_pose_numpy(samples_denorm)
     samples_full = np.asarray(_dga_full_pose(jnp.asarray(samples_denorm, dtype=jnp.float32)), dtype=np.float32)
+    scoring_guidance = guidance_config if guidance_config is not None else GuidanceConfig()
+    candidate_scores = _score_sample_candidates(
+        samples_full,
+        hand_point_spec=hand_point_spec,
+        object_points=object_points,
+        object_normals=object_normals,
+        guidance_config=scoring_guidance,
+    )
 
     trajectory_np = None
     if trajectories:
@@ -1060,10 +1129,23 @@ def sample(
         trajectory_np = dataset.normalizer.denormalize_numpy(trajectory_np)
         if project_to_valid_range:
             trajectory_np = dataset.normalizer.project_pose_numpy(trajectory_np)
+    selected_indices = None
+    selected_scores = None
+    if select_best_by_objective and int(k) > 1:
+        batch_index = np.arange(samples_denorm.shape[0], dtype=np.int32)
+        selected_indices = np.argmin(candidate_scores, axis=1).astype(np.int32)
+        selected_scores = candidate_scores[batch_index, selected_indices]
+        samples_denorm = samples_denorm[batch_index, selected_indices][:, None, :]
+        samples_full = samples_full[batch_index, selected_indices][:, None, :]
+        if trajectory_np is not None:
+            trajectory_np = trajectory_np[batch_index, selected_indices][:, None, :, :]
     return SamplingOutput(
         samples=samples_denorm,
         samples_full=samples_full,
         trajectory=trajectory_np,
+        candidate_scores=candidate_scores,
+        selected_indices=selected_indices,
+        selected_scores=selected_scores,
     )
 
 
@@ -1077,4 +1159,11 @@ def load_latest_checkpoint_state(checkpoint_dir: str | Path):
     state = load_checkpoint(checkpoint_dir, save_separately=True)
     if state is None:
         raise ValueError(f"No checkpoint found in {Path(checkpoint_dir).expanduser().resolve()}")
+    return state
+
+
+def load_best_checkpoint_state(checkpoint_dir: str | Path):
+    state = load_best_checkpoint(checkpoint_dir)
+    if state is None:
+        raise ValueError(f"No best checkpoint found in {Path(checkpoint_dir).expanduser().resolve()}")
     return state

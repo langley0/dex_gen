@@ -13,16 +13,18 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-from grasp_refine import SAMPLE_PRESETS, DiffusionConfig, DpmSolverConfig, GuidanceConfig, ModelConfig, first_batch, get_sample_preset, load_latest_checkpoint_state, sample
+from grasp_refine import SAMPLE_PRESETS, DiffusionConfig, DpmSolverConfig, GuidanceConfig, ModelConfig, first_batch, get_sample_preset, load_best_checkpoint_state, load_latest_checkpoint_state, sample
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run DDPM sampling from a trained grasp_refine checkpoint.")
     parser.add_argument("--dataset", type=Path, required=True, help="Prepared normalized DGA dataset (.npz).")
     parser.add_argument("--checkpoint-dir", type=Path, required=True, help="Checkpoint directory.")
+    parser.add_argument("--checkpoint-kind", choices=("latest", "best"), default="latest")
     parser.add_argument("--preset", choices=tuple(SAMPLE_PRESETS.keys()), default=None)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--samples", type=int, default=1)
+    parser.add_argument("--select-best-by-objective", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--diffusion-steps", type=int, default=4)
     parser.add_argument("--use-dpmsolver", action="store_true")
@@ -61,7 +63,11 @@ def main() -> None:
     args = parse_args()
     preset = {} if args.preset is None else get_sample_preset(str(args.preset))
     dataset, batch = first_batch(args.dataset, batch_size=int(args.batch_size))
-    checkpoint_state = load_latest_checkpoint_state(args.checkpoint_dir)
+    checkpoint_state = (
+        load_best_checkpoint_state(args.checkpoint_dir)
+        if args.checkpoint_kind == "best"
+        else load_latest_checkpoint_state(args.checkpoint_dir)
+    )
     model_config = ModelConfig(
         architecture="dga_unet",
         pose_dim=int(dataset.arrays.pose.shape[1]),
@@ -107,6 +113,7 @@ def main() -> None:
             opt_interval=int(args.opt_interval),
         ),
         project_to_valid_range=bool(preset.get("project_to_valid_range", args.project_to_valid_range)),
+        select_best_by_objective=bool(args.select_best_by_objective),
     )
 
     print(f"dataset path          : {dataset.path}")
@@ -116,6 +123,10 @@ def main() -> None:
     print(f"sample full shape     : {output.samples_full.shape}")
     if output.trajectory is not None:
         print(f"trajectory shape      : {output.trajectory.shape}")
+    if output.selected_indices is not None:
+        print(f"selected indices      : {output.selected_indices.tolist()}")
+    if output.selected_scores is not None:
+        print(f"selected scores       : {output.selected_scores.tolist()}")
     print(f"sample min/max        : {float(output.samples.min()):.6f} / {float(output.samples.max()):.6f}")
 
     if args.output is not None:
@@ -125,6 +136,12 @@ def main() -> None:
             "samples": output.samples.astype(np.float32),
             "samples_full": output.samples_full.astype(np.float32),
         }
+        if output.candidate_scores is not None:
+            payload["candidate_scores"] = output.candidate_scores.astype(np.float32)
+        if output.selected_indices is not None:
+            payload["selected_indices"] = output.selected_indices.astype(np.int32)
+        if output.selected_scores is not None:
+            payload["selected_scores"] = output.selected_scores.astype(np.float32)
         if output.trajectory is not None:
             payload["trajectory"] = output.trajectory.astype(np.float32)
         np.savez_compressed(output_path, **payload)

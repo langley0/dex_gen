@@ -3,6 +3,7 @@ from __future__ import annotations
 import pickle
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Any
 
 import jax
@@ -20,6 +21,13 @@ def _checkpoint_path(directory: Path, *, epoch: int, save_separately: bool) -> P
     if save_separately:
         return directory / f"model_{epoch}.pkl"
     return directory / "model.pkl"
+
+
+def _best_checkpoint_path(directory: Path) -> Path:
+    return directory / "model_best.pkl"
+
+
+_MODEL_EPOCH_RE = re.compile(r"^model_(\d+)\.pkl$")
 
 
 def save_checkpoint(
@@ -52,12 +60,39 @@ def save_checkpoint(
 
     if save_separately:
         checkpoint_files = sorted(
-            ckpt_dir.glob("model_*.pkl"),
-            key=lambda item: int(item.stem.split("_")[1]),
+            [item for item in ckpt_dir.glob("model_*.pkl") if _MODEL_EPOCH_RE.match(item.name)],
+            key=lambda item: int(_MODEL_EPOCH_RE.match(item.name).group(1)),
         )
         while len(checkpoint_files) > max(int(keep_last), 1):
             checkpoint_files[0].unlink(missing_ok=True)
             checkpoint_files.pop(0)
+    return path
+
+
+def save_best_checkpoint(
+    directory: str | Path,
+    *,
+    epoch: int,
+    step: int,
+    params: Any,
+    optimizer_state: Any,
+    save_scene_model: bool = True,
+) -> Path:
+    ckpt_dir = Path(directory).expanduser().resolve()
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    path = _best_checkpoint_path(ckpt_dir)
+    params_to_save = jax.device_get(params)
+    if not save_scene_model and isinstance(params_to_save, dict) and "scene_model" in params_to_save:
+        params_to_save = dict(params_to_save)
+        params_to_save.pop("scene_model")
+    payload = {
+        "epoch": int(epoch),
+        "step": int(step),
+        "params": params_to_save,
+        "optimizer_state": jax.device_get(optimizer_state),
+    }
+    with path.open("wb") as stream:
+        pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
     return path
 
 
@@ -71,8 +106,8 @@ def load_checkpoint(
         return None
     if save_separately:
         checkpoint_files = sorted(
-            ckpt_dir.glob("model_*.pkl"),
-            key=lambda item: int(item.stem.split("_")[1]),
+            [item for item in ckpt_dir.glob("model_*.pkl") if _MODEL_EPOCH_RE.match(item.name)],
+            key=lambda item: int(_MODEL_EPOCH_RE.match(item.name).group(1)),
         )
         if not checkpoint_files:
             return None
@@ -82,6 +117,21 @@ def load_checkpoint(
         if not path.exists():
             return None
 
+    with path.open("rb") as stream:
+        payload = pickle.load(stream)
+    return CheckpointState(
+        epoch=int(payload["epoch"]),
+        step=int(payload["step"]),
+        params=payload["params"],
+        optimizer_state=payload["optimizer_state"],
+    )
+
+
+def load_best_checkpoint(directory: str | Path) -> CheckpointState | None:
+    ckpt_dir = Path(directory).expanduser().resolve()
+    path = _best_checkpoint_path(ckpt_dir)
+    if not path.exists():
+        return None
     with path.open("rb") as stream:
         payload = pickle.load(stream)
     return CheckpointState(

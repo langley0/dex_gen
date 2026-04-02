@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from .dataset import DgaDataRecord, build_dga_data_records
-from .checkpoint import CheckpointState, load_checkpoint, save_checkpoint
+from .checkpoint import CheckpointState, load_best_checkpoint, load_checkpoint, save_best_checkpoint, save_checkpoint
 from .hand_spec import DgaHandSpec, load_dga_hand_spec
 from .hand_points import DgaHandPointSpec, load_dga_hand_point_spec
 from .io import SourceArtifactPayload, SourceGraspRecord, load_source_artifact, load_source_records, resolve_artifact_paths
@@ -37,7 +37,7 @@ from .training_types import (
 from .normalization import DgaPoseNormalizer, build_pose_normalizer, normalize_records
 from .object_identity import build_object_key, build_saved_object_key
 from .scene_encoder_pretrained import load_scene_encoder_pretrained_params, merge_param_tree, save_scene_encoder_pretrained_params
-from .sampling import DpmSolverConfig, GuidanceConfig, SamplingOutput, dpm_solver_sample_loop, first_batch, load_latest_checkpoint_state, p_sample, p_sample_loop, sample
+from .sampling import DpmSolverConfig, GuidanceConfig, SamplingOutput, dpm_solver_sample_loop, first_batch, load_best_checkpoint_state, load_latest_checkpoint_state, p_sample, p_sample_loop, sample
 from .presets import SAMPLE_PRESETS, TRAIN_PRESETS, get_sample_preset, get_train_preset
 from .types import ArtifactStateName, CoordinateMode, DatasetConfig
 
@@ -77,6 +77,8 @@ __all__ = [
     "build_saved_object_key",
     "collate_dga_batch",
     "load_scene_encoder_pretrained_params",
+    "load_best_checkpoint",
+    "load_best_checkpoint_state",
     "save_scene_encoder_pretrained_params",
     "first_batch",
     "get_sample_preset",
@@ -92,6 +94,7 @@ __all__ = [
     "load_saved_normalizer",
     "load_checkpoint",
     "load_latest_checkpoint_state",
+    "save_best_checkpoint",
     "normalize_records",
     "p_sample",
     "p_sample_loop",
