@@ -193,12 +193,13 @@ def main() -> None:
             training=True,
         )
 
+    manual_step = jax.jit(jax.value_and_grad(loss_fn, has_aux=True))
     shard_grads = []
     shard_metrics = []
     per_device = int(batch.pose.shape[0]) // device_count
     for device_index in range(device_count):
         local_batch = {key: value[device_index] for key, value in sharded_batch.items()}
-        (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, local_batch, shard_keys[device_index])
+        (_, metrics), grads = manual_step(params, local_batch, shard_keys[device_index])
         shard_grads.append(grads)
         shard_metrics.append(metrics)
     mean_grads_preclip = _tree_stack_mean(shard_grads)
@@ -234,6 +235,10 @@ def main() -> None:
     metrics_manual_host = {key: float(np.asarray(value)) for key, value in mean_metrics.items()}
 
     metric_diff = max(abs(metrics_manual_host[key] - metrics_dist_host[key]) for key in metrics_manual_host)
+    per_replica_raw_grad_diffs = [
+        _tree_max_abs(shard_grads[device_index], jax.tree_util.tree_map(lambda value: np.asarray(jax.device_get(value))[device_index], raw_grads_dist))
+        for device_index in range(device_count)
+    ]
     raw_grad_diff = _tree_max_abs(shard_grads[0], raw_grads_dist_host)
     raw_mean_to_pmean_diff = _tree_max_abs(raw_grads_dist_host_mean, mean_grads_dist_host)
     mean_grad_diff = _tree_max_abs(mean_grads_preclip, mean_grads_dist_host)
@@ -241,7 +246,8 @@ def main() -> None:
     param_diff = _tree_max_abs(params_manual, params_dist_host)
     step_diff, optimizer_mean_diff, optimizer_var_diff = _adam_state_diff(opt_manual, opt_dist_host)
     optimizer_diff = max(step_diff, optimizer_mean_diff, optimizer_var_diff)
-    worst = max(metric_diff, mean_grad_diff, clipped_grad_diff, param_diff, optimizer_diff)
+    internal_worst = max(raw_grad_diff, raw_mean_to_pmean_diff, mean_grad_diff)
+    update_worst = max(metric_diff, clipped_grad_diff, param_diff, optimizer_diff)
 
     print(f"local devices        : {device_count}")
     print(f"global batch         : {int(batch.pose.shape[0])}")
@@ -255,6 +261,10 @@ def main() -> None:
     print(f"optimizer step diff  : {step_diff:.8f}")
     print(f"optimizer mean diff  : {optimizer_mean_diff:.8f}")
     print(f"optimizer var diff   : {optimizer_var_diff:.8f}")
+    print("per-replica raw diff :")
+    for device_index, diff in enumerate(per_replica_raw_grad_diffs):
+        sample_index = int(batch.sample_index[device_index * per_device])
+        print(f"  replica={device_index} sample_index={sample_index} diff={diff:.8f}")
     print("top mean grad diffs  :")
     for path, diff in _top_leaf_diffs(mean_grads_preclip, mean_grads_dist_host):
         print(f"  {path} = {diff:.8f}")
@@ -264,8 +274,10 @@ def main() -> None:
     print("top optimizer diffs  :")
     for path, diff in _top_leaf_diffs(opt_manual.mean, opt_dist_host.mean):
         print(f"  {path} = {diff:.8f}")
-    print(f"exact status         : {'PASS' if worst < 1.0e-5 else 'FAIL'}")
-    print(f"practical status     : {'PASS' if worst < 2.0e-3 else 'FAIL'}")
+    print(f"internal exact       : {'PASS' if internal_worst < 1.0e-5 else 'FAIL'}")
+    print(f"internal practical   : {'PASS' if internal_worst < 2.0e-3 else 'FAIL'}")
+    print(f"update exact         : {'PASS' if update_worst < 1.0e-5 else 'FAIL'}")
+    print(f"update practical     : {'PASS' if update_worst < 2.0e-3 else 'FAIL'}")
 
 
 if __name__ == "__main__":
