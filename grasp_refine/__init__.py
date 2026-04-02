@@ -36,7 +36,7 @@ from .training_types import (
 )
 from .normalization import DgaPoseNormalizer, build_pose_normalizer, normalize_records
 from .object_identity import build_object_key, build_saved_object_key
-from .scene_encoder_pretrained import load_scene_encoder_pretrained_params, merge_param_tree
+from .scene_encoder_pretrained import load_scene_encoder_pretrained_params, merge_param_tree, save_scene_encoder_pretrained_params
 from .sampling import DpmSolverConfig, GuidanceConfig, SamplingOutput, dpm_solver_sample_loop, first_batch, load_latest_checkpoint_state, p_sample, p_sample_loop, sample
 from .types import ArtifactStateName, CoordinateMode, DatasetConfig
 
@@ -74,6 +74,7 @@ __all__ = [
     "build_saved_object_key",
     "collate_dga_batch",
     "load_scene_encoder_pretrained_params",
+    "save_scene_encoder_pretrained_params",
     "first_batch",
     "dpm_solver_sample_loop",
     "infer_hand_side",
