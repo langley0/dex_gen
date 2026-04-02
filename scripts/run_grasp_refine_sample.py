@@ -51,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--transformer-dim-head", type=int, default=8)
     parser.add_argument("--resblock-dropout", type=float, default=0.0)
     parser.add_argument("--transformer-dropout", type=float, default=0.1)
+    parser.add_argument("--project-to-valid-range", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
 
@@ -103,6 +104,7 @@ def main() -> None:
             srf_weight=float(args.guidance_srf_weight),
             opt_interval=int(args.opt_interval),
         ),
+        project_to_valid_range=bool(args.project_to_valid_range),
     )
 
     print(f"dataset path          : {dataset.path}")

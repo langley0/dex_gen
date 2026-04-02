@@ -1001,6 +1001,7 @@ def sample(
     return_trajectory: bool = False,
     dpm_config: DpmSolverConfig | None = None,
     guidance_config: GuidanceConfig | None = None,
+    project_to_valid_range: bool = True,
 ) -> SamplingOutput:
     schedule = make_diffusion_schedule(diffusion_config)
     object_points = jnp.asarray(batch.object_points, dtype=jnp.float32)
@@ -1049,12 +1050,16 @@ def sample(
             trajectories.append(trajectory)
     samples_np = np.asarray(jax.device_get(jnp.stack(sampled, axis=1)), dtype=np.float32)
     samples_denorm = dataset.normalizer.denormalize_numpy(samples_np)
+    if project_to_valid_range:
+        samples_denorm = dataset.normalizer.project_pose_numpy(samples_denorm)
     samples_full = np.asarray(_dga_full_pose(jnp.asarray(samples_denorm, dtype=jnp.float32)), dtype=np.float32)
 
     trajectory_np = None
     if trajectories:
         trajectory_np = np.asarray(jax.device_get(jnp.stack(trajectories, axis=1)), dtype=np.float32)
         trajectory_np = dataset.normalizer.denormalize_numpy(trajectory_np)
+        if project_to_valid_range:
+            trajectory_np = dataset.normalizer.project_pose_numpy(trajectory_np)
     return SamplingOutput(
         samples=samples_denorm,
         samples_full=samples_full,

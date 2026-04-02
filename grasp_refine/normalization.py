@@ -51,6 +51,26 @@ class DgaPoseNormalizer:
         joints = self._denormalize_block_jax(pose[..., 3:], joint_lower, joint_upper)
         return jnp.concatenate([root, joints], axis=-1)
 
+    def project_pose_numpy(self, pose: np.ndarray) -> np.ndarray:
+        pose_array = np.asarray(pose, dtype=np.float32)
+        if pose_array.shape[-1] != self.pose_dim:
+            raise ValueError(f"Expected pose dim {self.pose_dim}, got {pose_array.shape[-1]}.")
+        result = pose_array.copy()
+        result[..., :3] = np.clip(result[..., :3], self.translation_lower, self.translation_upper)
+        result[..., 3:] = np.clip(result[..., 3:], self.joint_lower, self.joint_upper)
+        return result.astype(np.float32)
+
+    def project_pose_jax(self, pose: jax.Array) -> jax.Array:
+        if pose.shape[-1] != self.pose_dim:
+            raise ValueError(f"Expected pose dim {self.pose_dim}, got {pose.shape[-1]}.")
+        translation_lower = jnp.asarray(self.translation_lower, dtype=pose.dtype)
+        translation_upper = jnp.asarray(self.translation_upper, dtype=pose.dtype)
+        joint_lower = jnp.asarray(self.joint_lower, dtype=pose.dtype)
+        joint_upper = jnp.asarray(self.joint_upper, dtype=pose.dtype)
+        root = jnp.clip(pose[..., :3], translation_lower, translation_upper)
+        joints = jnp.clip(pose[..., 3:], joint_lower, joint_upper)
+        return jnp.concatenate([root, joints], axis=-1)
+
     def state_dict(self) -> dict[str, np.ndarray]:
         return {
             "translation_lower": self.translation_lower.astype(np.float32),
