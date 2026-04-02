@@ -71,11 +71,52 @@ def _tree_div(tree, denom: float):
     return jax.tree_util.tree_map(lambda value: value / float(denom), tree)
 
 
+def _tree_stack_mean(trees):
+    if not trees:
+        raise ValueError("trees must not be empty")
+    return jax.tree_util.tree_map(lambda *values: jnp.mean(jnp.stack(values, axis=0), axis=0), *trees)
+
+
 def _tree_max_abs(lhs, rhs) -> float:
     leaves_l = jax.tree_util.tree_leaves(lhs)
     leaves_r = jax.tree_util.tree_leaves(rhs)
     diffs = [float(np.max(np.abs(np.asarray(a) - np.asarray(b)))) for a, b in zip(leaves_l, leaves_r, strict=True)]
     return max(diffs) if diffs else 0.0
+
+
+def _adam_state_diff(lhs, rhs) -> tuple[float, float, float]:
+    step_diff = float(np.max(np.abs(np.asarray(lhs.step) - np.asarray(rhs.step))))
+    mean_diff = _tree_max_abs(lhs.mean, rhs.mean)
+    var_diff = _tree_max_abs(lhs.var, rhs.var)
+    return step_diff, mean_diff, var_diff
+
+
+def _format_path(path) -> str:
+    parts = []
+    for entry in path:
+        key = getattr(entry, "key", None)
+        idx = getattr(entry, "idx", None)
+        name = getattr(entry, "name", None)
+        if key is not None:
+            parts.append(str(key))
+        elif idx is not None:
+            parts.append(str(idx))
+        elif name is not None:
+            parts.append(str(name))
+        else:
+            parts.append(str(entry))
+    return ".".join(parts)
+
+
+def _top_leaf_diffs(lhs, rhs, *, limit: int = 5) -> list[tuple[str, float]]:
+    lhs_flat, _ = jax.tree_util.tree_flatten_with_path(lhs)
+    rhs_flat, _ = jax.tree_util.tree_flatten_with_path(rhs)
+    rows = []
+    for (path_lhs, value_lhs), (path_rhs, value_rhs) in zip(lhs_flat, rhs_flat, strict=True):
+        diff = float(np.max(np.abs(np.asarray(value_lhs) - np.asarray(value_rhs))))
+        rows.append((_format_path(path_lhs), diff))
+    rows.sort(key=lambda item: item[1], reverse=True)
+    return rows[:limit]
 
 
 def parse_args() -> argparse.Namespace:
@@ -111,6 +152,8 @@ def main() -> None:
             transformer_depth=1,
             num_heads=8,
             transformer_dim_head=8,
+            resblock_dropout=0.0,
+            transformer_dropout=0.0,
         ),
         diffusion=DiffusionConfig(steps=int(args.diffusion_steps)),
         loss=LossConfig(),
@@ -125,7 +168,6 @@ def main() -> None:
     optimizer_state = init_adam(params)
     schedule = make_diffusion_schedule(config.diffusion)
 
-    full_batch = _batch_dict(batch)
     sharded_batch = _shard_batch(batch, device_count)
     shard_keys = jax.random.split(rng_key, device_count)
 
@@ -151,45 +193,66 @@ def main() -> None:
         (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, local_batch, shard_keys[device_index])
         shard_grads.append(grads)
         shard_metrics.append(metrics)
-    mean_grads = shard_grads[0]
-    mean_metrics = shard_metrics[0]
-    for grads in shard_grads[1:]:
-        mean_grads = _tree_add(mean_grads, grads)
-    for metrics in shard_metrics[1:]:
-        mean_metrics = _tree_add(mean_metrics, metrics)
-    mean_grads = _tree_div(mean_grads, device_count)
-    mean_metrics = _tree_div(mean_metrics, device_count)
-    mean_grads = _clip_grads(mean_grads, config.optimizer.grad_clip_norm)
+    mean_grads_preclip = _tree_stack_mean(shard_grads)
+    mean_metrics = _tree_stack_mean(shard_metrics)
+    mean_grads = _clip_grads(mean_grads_preclip, config.optimizer.grad_clip_norm)
     params_manual, opt_manual = adam_update(params, mean_grads, optimizer_state, lr=config.optimizer.lr)
 
     def train_step(params_rep, opt_rep, batch_rep, rng_rep):
         (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params_rep, batch_rep, rng_rep)
+        raw_grads = grads
         grads = jax.lax.pmean(grads, axis_name="devices")
         metrics = jax.lax.pmean(metrics, axis_name="devices")
-        grads = _clip_grads(grads, config.optimizer.grad_clip_norm)
-        next_params, next_opt = adam_update(params_rep, grads, opt_rep, lr=config.optimizer.lr)
-        return next_params, next_opt, metrics
+        clipped_grads = _clip_grads(grads, config.optimizer.grad_clip_norm)
+        next_params, next_opt = adam_update(params_rep, clipped_grads, opt_rep, lr=config.optimizer.lr)
+        return next_params, next_opt, metrics, raw_grads, grads, clipped_grads
 
     train_step_pmapped = jax.pmap(train_step, axis_name="devices")
     params_rep = jax.device_put_replicated(params, jax.devices()[:device_count])
     opt_rep = jax.device_put_replicated(optimizer_state, jax.devices()[:device_count])
-    params_dist, opt_dist, metrics_dist = train_step_pmapped(params_rep, opt_rep, sharded_batch, shard_keys)
+    params_dist, opt_dist, metrics_dist, raw_grads_dist, mean_grads_dist, clipped_grads_dist = train_step_pmapped(
+        params_rep,
+        opt_rep,
+        sharded_batch,
+        shard_keys,
+    )
     params_dist_host = jax.tree_util.tree_map(lambda value: np.asarray(jax.device_get(value))[0], params_dist)
     opt_dist_host = jax.tree_util.tree_map(lambda value: np.asarray(jax.device_get(value))[0], opt_dist)
     metrics_dist_host = jax.tree_util.tree_map(lambda value: float(np.asarray(jax.device_get(value))[0]), metrics_dist)
+    raw_grads_dist_host = jax.tree_util.tree_map(lambda value: np.asarray(jax.device_get(value))[0], raw_grads_dist)
+    mean_grads_dist_host = jax.tree_util.tree_map(lambda value: np.asarray(jax.device_get(value))[0], mean_grads_dist)
+    clipped_grads_dist_host = jax.tree_util.tree_map(lambda value: np.asarray(jax.device_get(value))[0], clipped_grads_dist)
     metrics_manual_host = {key: float(np.asarray(value)) for key, value in mean_metrics.items()}
 
     metric_diff = max(abs(metrics_manual_host[key] - metrics_dist_host[key]) for key in metrics_manual_host)
+    raw_grad_diff = _tree_max_abs(shard_grads[0], raw_grads_dist_host)
+    mean_grad_diff = _tree_max_abs(mean_grads_preclip, mean_grads_dist_host)
+    clipped_grad_diff = _tree_max_abs(mean_grads, clipped_grads_dist_host)
     param_diff = _tree_max_abs(params_manual, params_dist_host)
-    optimizer_diff = _tree_max_abs(opt_manual, opt_dist_host)
-    worst = max(metric_diff, param_diff, optimizer_diff)
+    step_diff, optimizer_mean_diff, optimizer_var_diff = _adam_state_diff(opt_manual, opt_dist_host)
+    optimizer_diff = max(step_diff, optimizer_mean_diff, optimizer_var_diff)
+    worst = max(metric_diff, mean_grad_diff, clipped_grad_diff, param_diff, optimizer_diff)
 
     print(f"local devices        : {device_count}")
     print(f"global batch         : {int(batch.pose.shape[0])}")
     print(f"per-device batch     : {per_device}")
     print(f"metric diff          : {metric_diff:.8f}")
+    print(f"raw grad diff        : {raw_grad_diff:.8f}")
+    print(f"mean grad diff       : {mean_grad_diff:.8f}")
+    print(f"clipped grad diff    : {clipped_grad_diff:.8f}")
     print(f"param diff           : {param_diff:.8f}")
-    print(f"optimizer diff       : {optimizer_diff:.8f}")
+    print(f"optimizer step diff  : {step_diff:.8f}")
+    print(f"optimizer mean diff  : {optimizer_mean_diff:.8f}")
+    print(f"optimizer var diff   : {optimizer_var_diff:.8f}")
+    print("top mean grad diffs  :")
+    for path, diff in _top_leaf_diffs(mean_grads_preclip, mean_grads_dist_host):
+        print(f"  {path} = {diff:.8f}")
+    print("top clipped diffs    :")
+    for path, diff in _top_leaf_diffs(mean_grads, clipped_grads_dist_host):
+        print(f"  {path} = {diff:.8f}")
+    print("top optimizer diffs  :")
+    for path, diff in _top_leaf_diffs(opt_manual.mean, opt_dist_host.mean):
+        print(f"  {path} = {diff:.8f}")
     print(f"exact status         : {'PASS' if worst < 1.0e-5 else 'FAIL'}")
     print(f"practical status     : {'PASS' if worst < 2.0e-3 else 'FAIL'}")
 
