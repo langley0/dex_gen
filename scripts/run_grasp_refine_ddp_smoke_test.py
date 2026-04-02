@@ -77,6 +77,14 @@ def _tree_stack_mean(trees):
     return jax.tree_util.tree_map(lambda *values: jnp.mean(jnp.stack(values, axis=0), axis=0), *trees)
 
 
+def _first_replica(tree):
+    return jax.tree_util.tree_map(lambda value: np.asarray(jax.device_get(value))[0], tree)
+
+
+def _host_mean_replicas(tree):
+    return jax.tree_util.tree_map(lambda value: np.asarray(jax.device_get(value)).mean(axis=0), tree)
+
+
 def _tree_max_abs(lhs, rhs) -> float:
     leaves_l = jax.tree_util.tree_leaves(lhs)
     leaves_r = jax.tree_util.tree_leaves(rhs)
@@ -216,16 +224,18 @@ def main() -> None:
         sharded_batch,
         shard_keys,
     )
-    params_dist_host = jax.tree_util.tree_map(lambda value: np.asarray(jax.device_get(value))[0], params_dist)
-    opt_dist_host = jax.tree_util.tree_map(lambda value: np.asarray(jax.device_get(value))[0], opt_dist)
+    params_dist_host = _first_replica(params_dist)
+    opt_dist_host = _first_replica(opt_dist)
     metrics_dist_host = jax.tree_util.tree_map(lambda value: float(np.asarray(jax.device_get(value))[0]), metrics_dist)
-    raw_grads_dist_host = jax.tree_util.tree_map(lambda value: np.asarray(jax.device_get(value))[0], raw_grads_dist)
-    mean_grads_dist_host = jax.tree_util.tree_map(lambda value: np.asarray(jax.device_get(value))[0], mean_grads_dist)
-    clipped_grads_dist_host = jax.tree_util.tree_map(lambda value: np.asarray(jax.device_get(value))[0], clipped_grads_dist)
+    raw_grads_dist_host = _first_replica(raw_grads_dist)
+    raw_grads_dist_host_mean = _host_mean_replicas(raw_grads_dist)
+    mean_grads_dist_host = _first_replica(mean_grads_dist)
+    clipped_grads_dist_host = _first_replica(clipped_grads_dist)
     metrics_manual_host = {key: float(np.asarray(value)) for key, value in mean_metrics.items()}
 
     metric_diff = max(abs(metrics_manual_host[key] - metrics_dist_host[key]) for key in metrics_manual_host)
     raw_grad_diff = _tree_max_abs(shard_grads[0], raw_grads_dist_host)
+    raw_mean_to_pmean_diff = _tree_max_abs(raw_grads_dist_host_mean, mean_grads_dist_host)
     mean_grad_diff = _tree_max_abs(mean_grads_preclip, mean_grads_dist_host)
     clipped_grad_diff = _tree_max_abs(mean_grads, clipped_grads_dist_host)
     param_diff = _tree_max_abs(params_manual, params_dist_host)
@@ -238,6 +248,7 @@ def main() -> None:
     print(f"per-device batch     : {per_device}")
     print(f"metric diff          : {metric_diff:.8f}")
     print(f"raw grad diff        : {raw_grad_diff:.8f}")
+    print(f"raw->pmean diff      : {raw_mean_to_pmean_diff:.8f}")
     print(f"mean grad diff       : {mean_grad_diff:.8f}")
     print(f"clipped grad diff    : {clipped_grad_diff:.8f}")
     print(f"param diff           : {param_diff:.8f}")
