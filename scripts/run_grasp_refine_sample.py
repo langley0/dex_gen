@@ -13,13 +13,14 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-from grasp_refine import DiffusionConfig, DpmSolverConfig, GuidanceConfig, ModelConfig, first_batch, load_latest_checkpoint_state, sample
+from grasp_refine import SAMPLE_PRESETS, DiffusionConfig, DpmSolverConfig, GuidanceConfig, ModelConfig, first_batch, get_sample_preset, load_latest_checkpoint_state, sample
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run DDPM sampling from a trained grasp_refine checkpoint.")
     parser.add_argument("--dataset", type=Path, required=True, help="Prepared normalized DGA dataset (.npz).")
     parser.add_argument("--checkpoint-dir", type=Path, required=True, help="Checkpoint directory.")
+    parser.add_argument("--preset", choices=tuple(SAMPLE_PRESETS.keys()), default=None)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--samples", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
@@ -58,28 +59,29 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    preset = {} if args.preset is None else get_sample_preset(str(args.preset))
     dataset, batch = first_batch(args.dataset, batch_size=int(args.batch_size))
     checkpoint_state = load_latest_checkpoint_state(args.checkpoint_dir)
     model_config = ModelConfig(
         architecture="dga_unet",
         pose_dim=int(dataset.arrays.pose.shape[1]),
-        hidden_dim=int(args.hidden_dim),
-        context_dim=int(args.context_dim),
-        context_tokens=int(args.context_tokens),
-        scene_encoder_layers=int(args.scene_encoder_layers),
-        denoiser_blocks=int(args.denoiser_blocks),
-        transformer_depth=int(args.transformer_depth),
-        num_heads=int(args.num_heads),
-        transformer_dim_head=int(args.transformer_dim_head),
-        resblock_dropout=float(args.resblock_dropout),
-        transformer_dropout=float(args.transformer_dropout),
+        hidden_dim=int(preset.get("hidden_dim", args.hidden_dim)),
+        context_dim=int(preset.get("context_dim", args.context_dim)),
+        context_tokens=int(preset.get("context_tokens", args.context_tokens)),
+        scene_encoder_layers=int(preset.get("scene_encoder_layers", args.scene_encoder_layers)),
+        denoiser_blocks=int(preset.get("denoiser_blocks", args.denoiser_blocks)),
+        transformer_depth=int(preset.get("transformer_depth", args.transformer_depth)),
+        num_heads=int(preset.get("num_heads", args.num_heads)),
+        transformer_dim_head=int(preset.get("transformer_dim_head", args.transformer_dim_head)),
+        resblock_dropout=float(preset.get("resblock_dropout", args.resblock_dropout)),
+        transformer_dropout=float(preset.get("transformer_dropout", args.transformer_dropout)),
     )
     output = sample(
         checkpoint_state.params,
         batch,
         dataset=dataset,
         model_config=model_config,
-        diffusion_config=DiffusionConfig(steps=int(args.diffusion_steps)),
+        diffusion_config=DiffusionConfig(steps=int(preset.get("diffusion_steps", args.diffusion_steps))),
         rng_key=jax.random.key(np.uint32(int(args.seed) % (2**32))),
         k=int(args.samples),
         return_trajectory=True,
@@ -94,7 +96,7 @@ def main() -> None:
             lower_order_final=bool(args.dpm_lower_order_final),
         ),
         guidance_config=GuidanceConfig(
-            enabled=bool(args.use_guidance),
+            enabled=bool(preset.get("use_guidance", args.use_guidance)),
             guidance_scale=float(args.guidance_scale),
             grad_scale=float(args.grad_scale),
             clip_grad_min=float(args.clip_grad_min),
@@ -104,7 +106,7 @@ def main() -> None:
             srf_weight=float(args.guidance_srf_weight),
             opt_interval=int(args.opt_interval),
         ),
-        project_to_valid_range=bool(args.project_to_valid_range),
+        project_to_valid_range=bool(preset.get("project_to_valid_range", args.project_to_valid_range)),
     )
 
     print(f"dataset path          : {dataset.path}")

@@ -17,6 +17,8 @@ from grasp_refine import (
     OptimizerConfig,
     PreparedDatasetConfig,
     TrainingConfig,
+    TRAIN_PRESETS,
+    get_train_preset,
     train_grasp_diffusion,
 )
 
@@ -24,6 +26,7 @@ from grasp_refine import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a minimal DGA-style grasp diffusion model from a prepared dataset.")
     parser.add_argument("--dataset", type=Path, required=True, help="Prepared normalized DGA dataset (.npz).")
+    parser.add_argument("--preset", choices=tuple(TRAIN_PRESETS.keys()), default=None)
     parser.add_argument("--architecture", choices=("mlp", "dga_unet", "dga_transformer"), default="dga_unet")
     parser.add_argument("--train-fraction", type=float, default=0.9)
     parser.add_argument("--split-mode", choices=("sample", "object", "object_random", "object_fixed"), default="sample")
@@ -62,6 +65,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    preset = {} if args.preset is None else get_train_preset(str(args.preset))
     config = TrainingConfig(
         dataset=PreparedDatasetConfig(
             path=args.dataset.expanduser().resolve(),
@@ -71,28 +75,28 @@ def main() -> None:
             val_object_keys=tuple(args.val_object_key or ()),
         ),
         model=ModelConfig(
-            architecture=args.architecture,
-            hidden_dim=int(args.hidden_dim),
-            context_dim=int(args.context_dim),
-            context_tokens=int(args.context_tokens),
-            scene_encoder_layers=int(args.scene_encoder_layers),
-            denoiser_blocks=int(args.denoiser_blocks),
-            transformer_depth=int(args.transformer_depth),
-            num_heads=int(args.num_heads),
-            resblock_dropout=float(args.resblock_dropout),
-            transformer_dropout=float(args.transformer_dropout),
-            transformer_dim_head=int(args.transformer_dim_head),
+            architecture=str(preset.get("architecture", args.architecture)),
+            hidden_dim=int(preset.get("hidden_dim", args.hidden_dim)),
+            context_dim=int(preset.get("context_dim", args.context_dim)),
+            context_tokens=int(preset.get("context_tokens", args.context_tokens)),
+            scene_encoder_layers=int(preset.get("scene_encoder_layers", args.scene_encoder_layers)),
+            denoiser_blocks=int(preset.get("denoiser_blocks", args.denoiser_blocks)),
+            transformer_depth=int(preset.get("transformer_depth", args.transformer_depth)),
+            num_heads=int(preset.get("num_heads", args.num_heads)),
+            resblock_dropout=float(preset.get("resblock_dropout", args.resblock_dropout)),
+            transformer_dropout=float(preset.get("transformer_dropout", args.transformer_dropout)),
+            transformer_dim_head=int(preset.get("transformer_dim_head", args.transformer_dim_head)),
             scene_encoder_pretrained=None if args.scene_encoder_pretrained is None else args.scene_encoder_pretrained.expanduser().resolve(),
             freeze_scene_encoder=bool(args.freeze_scene_encoder),
         ),
-        diffusion=DiffusionConfig(steps=int(args.diffusion_steps)),
+        diffusion=DiffusionConfig(steps=int(preset.get("diffusion_steps", args.diffusion_steps))),
         loss=LossConfig(),
         optimizer=OptimizerConfig(
-            lr=float(args.lr),
+            lr=float(preset.get("lr", args.lr)),
             weight_decay=float(args.weight_decay),
-            batch_size=int(args.batch_size),
+            batch_size=int(preset.get("batch_size", args.batch_size)),
             epochs=int(args.epochs),
-            grad_clip_norm=float(args.grad_clip_norm),
+            grad_clip_norm=float(preset.get("grad_clip_norm", args.grad_clip_norm)),
         ),
         log_step=int(args.log_step),
         run_validation=bool(args.run_validation),
@@ -101,7 +105,7 @@ def main() -> None:
         save_model_separately=bool(args.save_model_separately),
         save_scene_model=bool(args.save_scene_model),
         metrics_path=None if args.metrics_path is None else args.metrics_path.expanduser().resolve(),
-        distributed=bool(args.distributed),
+        distributed=bool(preset.get("distributed", args.distributed)),
         device=args.device,
         seed=int(args.seed),
     )

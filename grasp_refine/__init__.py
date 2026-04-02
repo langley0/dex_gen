@@ -38,6 +38,7 @@ from .normalization import DgaPoseNormalizer, build_pose_normalizer, normalize_r
 from .object_identity import build_object_key, build_saved_object_key
 from .scene_encoder_pretrained import load_scene_encoder_pretrained_params, merge_param_tree, save_scene_encoder_pretrained_params
 from .sampling import DpmSolverConfig, GuidanceConfig, SamplingOutput, dpm_solver_sample_loop, first_batch, load_latest_checkpoint_state, p_sample, p_sample_loop, sample
+from .presets import SAMPLE_PRESETS, TRAIN_PRESETS, get_sample_preset, get_train_preset
 from .types import ArtifactStateName, CoordinateMode, DatasetConfig
 
 __all__ = [
@@ -65,6 +66,8 @@ __all__ = [
     "SamplingOutput",
     "SourceArtifactPayload",
     "SourceGraspRecord",
+    "SAMPLE_PRESETS",
+    "TRAIN_PRESETS",
     "TrainingConfig",
     "TrainingResult",
     "build_dga_data_records",
@@ -76,6 +79,8 @@ __all__ = [
     "load_scene_encoder_pretrained_params",
     "save_scene_encoder_pretrained_params",
     "first_batch",
+    "get_sample_preset",
+    "get_train_preset",
     "dpm_solver_sample_loop",
     "infer_hand_side",
     "iterate_dga_batches",
