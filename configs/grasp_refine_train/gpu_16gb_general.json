@@ -1,0 +1,55 @@
+{
+  "checkpoint": {
+    "keep_last": 5,
+    "output_dir": "outputs/grasp_refine_train/gpu_16gb_general",
+    "resume_from": null,
+    "save_every": 100
+  },
+  "dataset": {
+    "artifact_glob": null,
+    "artifact_paths": [],
+    "drop_invalid_samples": true,
+    "normalizer_padding": 0.02,
+    "num_workers": 0,
+    "object_num_points": 2048,
+    "object_point_seed": 13,
+    "pin_memory": true,
+    "seed": 0,
+    "state_name": "best",
+    "train_fraction": 1.0
+  },
+  "device": "gpu",
+  "diffusion": {
+    "beta_end": 0.01,
+    "beta_start": 0.0001,
+    "loss_type": "l1",
+    "rand_t_type": "half",
+    "steps": 100
+  },
+  "hand_side": "right",
+  "loss": {
+    "joint_limit_weight": 0.1,
+    "noise_weight": 1.0,
+    "root_distance_threshold": 0.02,
+    "root_distance_weight": 0.05
+  },
+  "model": {
+    "context_dim": 256,
+    "context_tokens": 8,
+    "denoiser_blocks": 4,
+    "dropout": 0.1,
+    "hidden_dim": 256,
+    "num_heads": 8,
+    "point_feature_dim": 6,
+    "pose_dim": 21,
+    "time_embed_dim": 256
+  },
+  "optimizer": {
+    "batch_size": 64,
+    "epochs": 120,
+    "grad_clip_norm": 1.0,
+    "lr": 0.0001,
+    "weight_decay": 0.0001
+  },
+  "seed": 0
+}

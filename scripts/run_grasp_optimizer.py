@@ -2,9 +2,66 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+_REQUESTED_BACKEND = "auto"
+_NORMALIZED_JAX_PLATFORMS = ""
+
+
+def _normalize_jax_platforms(raw_value: str | None) -> str | None:
+    if raw_value is None:
+        return None
+    value = raw_value.strip()
+    if not value or value.lower() == "auto":
+        return ""
+
+    alias_map = {
+        "gpu": "cuda",
+        "cuda": "cuda",
+        "cpu": "cpu",
+        "tpu": "tpu",
+        "rocm": "rocm",
+    }
+    parts = [part.strip().lower() for part in value.split(",") if part.strip()]
+    if not parts:
+        return ""
+
+    normalized: list[str] = []
+    for part in parts:
+        normalized.append(alias_map.get(part, part))
+    return ",".join(normalized)
+
+
+def _extract_backend_override(argv: list[str]) -> str | None:
+    for index, token in enumerate(argv):
+        if token == "--backend" and index + 1 < len(argv):
+            return argv[index + 1]
+        if token.startswith("--backend="):
+            return token.split("=", 1)[1]
+    return None
+
+
+def _configure_jax_platforms(argv: list[str]) -> None:
+    global _NORMALIZED_JAX_PLATFORMS, _REQUESTED_BACKEND
+
+    cli_value = _extract_backend_override(argv)
+    env_value = os.environ.get("JAX_PLATFORMS")
+    selected = cli_value if cli_value is not None else env_value
+    normalized = _normalize_jax_platforms(selected)
+    _REQUESTED_BACKEND = selected.strip() if isinstance(selected, str) and selected.strip() else "auto"
+    if normalized is None:
+        os.environ.setdefault("JAX_PLATFORMS", "")
+        _NORMALIZED_JAX_PLATFORMS = os.environ["JAX_PLATFORMS"]
+        return
+    os.environ["JAX_PLATFORMS"] = normalized
+    _NORMALIZED_JAX_PLATFORMS = normalized
+
+
+_configure_jax_platforms(sys.argv[1:])
 
 import jax
 import numpy as np
@@ -13,6 +70,9 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
+
+if TYPE_CHECKING:
+    from grasp_gen.prop import Prop
 
 from grasp_gen.grasp_energy import GraspEnergyConfig, GraspEnergyModel
 from grasp_gen.grasp_optimizer import GraspBatchOptimizer, GraspBatchOptimizerConfig
@@ -67,6 +127,12 @@ def _result_stats(state) -> dict[str, float | int]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the batched grasp optimizer and save the result to disk.")
+    parser.add_argument(
+        "--backend",
+        choices=("auto", "cpu", "gpu", "cuda", "tpu"),
+        default=None,
+        help="JAX backend to request. 'gpu' is normalized to JAX's 'cuda'. Defaults to automatic selection.",
+    )
     parser.add_argument("--hand", choices=("right", "left"), default="right")
     parser.add_argument("--object", choices=("cylinder", "cube", "drill", "decor01"), default="cylinder")
     parser.add_argument("--cube-size", type=float, default=CUBE_SIZE, help="Cube edge length when --object cube.")
@@ -196,6 +262,8 @@ def main() -> None:
             "batch": int(args.batch),
             "steps": int(args.steps),
             "seed": int(args.seed),
+            "requested_backend": _REQUESTED_BACKEND,
+            "normalized_platforms": _NORMALIZED_JAX_PLATFORMS,
             "backend": jax.default_backend(),
             "bench_steps": int(args.bench_steps),
         },
@@ -221,6 +289,8 @@ def main() -> None:
     bottleneck = find_bottleneck(profile_summary)
 
     print(f"output path      : {output_path}")
+    print(f"requested backend: {_REQUESTED_BACKEND}")
+    print(f"jax platforms    : {_NORMALIZED_JAX_PLATFORMS or 'auto'}")
     print(f"jax backend      : {jax.default_backend()}")
     print(f"batch size       : {args.batch}")
     print(f"step count       : {args.steps}")
