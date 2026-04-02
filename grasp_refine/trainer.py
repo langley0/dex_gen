@@ -29,6 +29,14 @@ def _select_device(device_name: str) -> JaxDevice:
         return jax.devices()[0]
 
 
+def _select_devices(device_name: str) -> tuple[JaxDevice, ...]:
+    try:
+        devices = tuple(jax.devices(device_name))
+    except Exception:
+        devices = tuple(jax.devices())
+    return devices if devices else tuple(jax.devices())
+
+
 def _resolve_model_config(config: TrainingConfig, pose_dim: int) -> ModelConfig:
     if config.model.pose_dim in (0, pose_dim):
         return replace(config.model, pose_dim=int(pose_dim))
@@ -44,6 +52,24 @@ def _batch_to_jax(batch: DgaBatch, device: JaxDevice) -> dict[str, jax.Array]:
     }
 
 
+def _batch_to_sharded_jax(batch: DgaBatch, num_devices: int) -> dict[str, jax.Array]:
+    batch_size = int(batch.pose.shape[0])
+    if batch_size % int(num_devices) != 0:
+        raise ValueError(f"Global batch size {batch_size} must be divisible by num_devices={num_devices}.")
+    per_device_batch = batch_size // int(num_devices)
+
+    def reshape(array: np.ndarray, *, dtype: jnp.dtype) -> jax.Array:
+        host = np.asarray(array, dtype=np.dtype(dtype))
+        return jnp.asarray(host.reshape((int(num_devices), per_device_batch) + host.shape[1:]), dtype=dtype)
+
+    return {
+        "pose": reshape(batch.pose, dtype=jnp.float32),
+        "pose_raw": reshape(batch.pose_raw, dtype=jnp.float32),
+        "object_points": reshape(batch.object_points, dtype=jnp.float32),
+        "object_normals": reshape(batch.object_normals, dtype=jnp.float32),
+    }
+
+
 def _global_norm(tree) -> jax.Array:
     leaves = jax.tree_util.tree_leaves(tree)
     squared = [jnp.sum(jnp.square(leaf)) for leaf in leaves]
@@ -56,6 +82,14 @@ def _clip_grads(grads, max_norm: float):
     norm = _global_norm(grads)
     scale = jnp.minimum(1.0, float(max_norm) / (norm + 1.0e-8))
     return jax.tree_util.tree_map(lambda value: value * scale, grads)
+
+
+def _replicate_tree(tree, devices: tuple[JaxDevice, ...]):
+    return jax.device_put_replicated(tree, devices)
+
+
+def _unreplicate_tree(tree):
+    return jax.tree_util.tree_map(lambda value: np.asarray(jax.device_get(value))[0], tree)
 
 
 def _freeze_scene_encoder_grads(grads, architecture: str):
@@ -126,6 +160,58 @@ def _build_step_functions(config: TrainingConfig, model_config: ModelConfig, nor
     return jax.jit(train_step), jax.jit(eval_step)
 
 
+def _build_distributed_step_functions(config: TrainingConfig, model_config: ModelConfig, normalizer, hand_point_spec, schedule):
+    axis_name = "devices"
+
+    def loss_fn(params, batch, rng_key):
+        return diffusion_loss(
+            params,
+            batch,
+            rng_key,
+            model_config=model_config,
+            diffusion_config=config.diffusion,
+            loss_config=config.loss,
+            normalizer=normalizer,
+            hand_point_spec=hand_point_spec,
+            schedule=schedule,
+            training=True,
+        )
+
+    def eval_loss_fn(params, batch, rng_key):
+        return diffusion_loss(
+            params,
+            batch,
+            rng_key,
+            model_config=model_config,
+            diffusion_config=config.diffusion,
+            loss_config=config.loss,
+            normalizer=normalizer,
+            hand_point_spec=hand_point_spec,
+            schedule=schedule,
+            training=False,
+        )
+
+    def train_step(params, optimizer_state: AdamState, batch, rng_key):
+        (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, batch, rng_key)
+        if model_config.freeze_scene_encoder:
+            grads = _freeze_scene_encoder_grads(grads, model_config.architecture)
+        grads = jax.lax.pmean(grads, axis_name=axis_name)
+        metrics = jax.lax.pmean(metrics, axis_name=axis_name)
+        grads = _clip_grads(grads, config.optimizer.grad_clip_norm)
+        next_params, next_optimizer_state = adam_update(params, grads, optimizer_state, lr=config.optimizer.lr)
+        return next_params, next_optimizer_state, metrics
+
+    def eval_step(params, batch, rng_key):
+        _, metrics = eval_loss_fn(params, batch, rng_key)
+        metrics = jax.lax.pmean(metrics, axis_name=axis_name)
+        return metrics
+
+    return (
+        jax.pmap(train_step, axis_name=axis_name),
+        jax.pmap(eval_step, axis_name=axis_name),
+    )
+
+
 def train_grasp_diffusion(config: TrainingConfig) -> TrainingResult:
     dataset = load_saved_dga_dataset(config.dataset.path)
     train_subset, val_subset = split_dga_dataset(
@@ -140,13 +226,14 @@ def train_grasp_diffusion(config: TrainingConfig) -> TrainingResult:
     hand_side = str(dataset.arrays.hand_side[0])
     hand_point_spec = load_dga_hand_point_spec(hand_side)
     model_config = _resolve_model_config(config, dataset.normalizer.pose_dim)
-    device = _select_device(config.device)
+    devices = _select_devices(config.device)
+    primary_device = devices[0]
+    distributed = bool(config.distributed) and len(devices) > 1
 
     rng_key = jax.random.key(np.uint32(int(config.seed) % (2**32)))
-    params = jax.device_put(init_model_params(rng_key, model_config), device)
-    optimizer_state = jax.device_put(init_adam(params), device)
-    schedule = jax.device_put(make_diffusion_schedule(config.diffusion), device)
-    train_step, eval_step = _build_step_functions(config, model_config, dataset.normalizer, hand_point_spec, schedule)
+    params_host = init_model_params(rng_key, model_config)
+    optimizer_state_host = init_adam(params_host)
+    schedule = jax.device_put(make_diffusion_schedule(config.diffusion), primary_device)
 
     checkpoint_state = None
     metrics_stream = None
@@ -159,9 +246,31 @@ def train_grasp_diffusion(config: TrainingConfig) -> TrainingResult:
             save_separately=config.save_model_separately,
         )
         if checkpoint_state is not None:
-            merged_params = merge_param_tree(jax.device_get(params), checkpoint_state.params)
-            params = jax.device_put(merged_params, device)
-            optimizer_state = jax.device_put(checkpoint_state.optimizer_state, device)
+            params_host = merge_param_tree(params_host, checkpoint_state.params)
+            optimizer_state_host = checkpoint_state.optimizer_state
+
+    fallback_eval_step = None
+    if distributed:
+        params = _replicate_tree(params_host, devices)
+        optimizer_state = _replicate_tree(optimizer_state_host, devices)
+        train_step, eval_step = _build_distributed_step_functions(
+            config,
+            model_config,
+            dataset.normalizer,
+            hand_point_spec,
+            schedule,
+        )
+        _, fallback_eval_step = _build_step_functions(
+            config,
+            model_config,
+            dataset.normalizer,
+            hand_point_spec,
+            schedule,
+        )
+    else:
+        params = jax.device_put(params_host, primary_device)
+        optimizer_state = jax.device_put(optimizer_state_host, primary_device)
+        train_step, eval_step = _build_step_functions(config, model_config, dataset.normalizer, hand_point_spec, schedule)
 
     start_epoch = 0 if checkpoint_state is None else int(checkpoint_state.epoch) + 1
     step = 0 if checkpoint_state is None else int(checkpoint_state.step)
@@ -174,12 +283,21 @@ def train_grasp_diffusion(config: TrainingConfig) -> TrainingResult:
                 batch_size=config.optimizer.batch_size,
                 shuffle=True,
                 seed=config.seed + epoch,
+                drop_last=distributed,
             )
         ):
-            batch_jax = _batch_to_jax(batch, device)
-            step_key = jax.random.key(np.uint32((config.seed + epoch * 10_003 + batch_index) % (2**32)))
-            params, optimizer_state, metrics = train_step(params, optimizer_state, batch_jax, step_key)
-            metrics_host = jax.device_get(metrics)
+            if distributed:
+                batch_jax = _batch_to_sharded_jax(batch, len(devices))
+                step_seed = np.uint32((config.seed + epoch * 10_003 + batch_index) % (2**32))
+                step_key = jax.random.key(step_seed)
+                step_keys = jax.random.split(step_key, len(devices))
+                params, optimizer_state, metrics = train_step(params, optimizer_state, batch_jax, step_keys)
+                metrics_host = _unreplicate_tree(metrics)
+            else:
+                batch_jax = _batch_to_jax(batch, primary_device)
+                step_key = jax.random.key(np.uint32((config.seed + epoch * 10_003 + batch_index) % (2**32)))
+                params, optimizer_state, metrics = train_step(params, optimizer_state, batch_jax, step_key)
+                metrics_host = jax.device_get(metrics)
             train_rows.append((int(batch.pose.shape[0]), {key: float(np.asarray(value)) for key, value in metrics_host.items()}))
             step += 1
             if config.log_step > 0 and step % config.log_step == 0:
@@ -209,10 +327,19 @@ def train_grasp_diffusion(config: TrainingConfig) -> TrainingResult:
                     seed=config.seed + epoch,
                 )
             ):
-                batch_jax = _batch_to_jax(batch, device)
-                step_key = jax.random.key(np.uint32((config.seed + 1_000_003 + epoch * 10_003 + batch_index) % (2**32)))
-                metrics = eval_step(params, batch_jax, step_key)
-                metrics_host = jax.device_get(metrics)
+                if distributed and int(batch.pose.shape[0]) % len(devices) == 0:
+                    batch_jax = _batch_to_sharded_jax(batch, len(devices))
+                    step_seed = np.uint32((config.seed + 1_000_003 + epoch * 10_003 + batch_index) % (2**32))
+                    step_key = jax.random.key(step_seed)
+                    step_keys = jax.random.split(step_key, len(devices))
+                    metrics = eval_step(params, batch_jax, step_keys)
+                    metrics_host = _unreplicate_tree(metrics)
+                else:
+                    params_eval = _unreplicate_tree(params) if distributed else params
+                    batch_jax = _batch_to_jax(batch, primary_device)
+                    step_key = jax.random.key(np.uint32((config.seed + 1_000_003 + epoch * 10_003 + batch_index) % (2**32)))
+                    metrics = fallback_eval_step(params_eval, batch_jax, step_key) if distributed else eval_step(params_eval, batch_jax, step_key)
+                    metrics_host = jax.device_get(metrics)
                 val_rows.append((int(batch.pose.shape[0]), {key: float(np.asarray(value)) for key, value in metrics_host.items()}))
 
         train_metrics = _mean_metric_rows(train_rows)
@@ -234,8 +361,8 @@ def train_grasp_diffusion(config: TrainingConfig) -> TrainingResult:
                 config.checkpoint_dir,
                 epoch=epoch,
                 step=step,
-                params=params,
-                optimizer_state=optimizer_state,
+                params=_unreplicate_tree(params) if distributed else params,
+                optimizer_state=_unreplicate_tree(optimizer_state) if distributed else optimizer_state,
                 save_separately=config.save_model_separately,
                 save_scene_model=config.save_scene_model,
             )
@@ -265,4 +392,6 @@ def train_grasp_diffusion(config: TrainingConfig) -> TrainingResult:
         resolved_model_config=model_config,
         history=tuple(history),
         final_step=step,
+        distributed=distributed,
+        device_count=len(devices),
     )

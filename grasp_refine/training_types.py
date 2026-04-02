@@ -78,6 +78,7 @@ class TrainingConfig:
     save_model_separately: bool = True
     save_scene_model: bool = True
     metrics_path: Path | None = None
+    distributed: bool = True
     device: str = "cpu"
     seed: int = 2022
 
@@ -99,3 +100,5 @@ class TrainingResult:
     resolved_model_config: ModelConfig
     history: tuple[EpochMetrics, ...]
     final_step: int
+    distributed: bool = False
+    device_count: int = 1

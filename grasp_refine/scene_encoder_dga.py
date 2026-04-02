@@ -6,6 +6,13 @@ import jax
 import jax.numpy as jnp
 
 
+DGA_SCENE_ENCODER_PLANES = (32, 64, 128, 256, 512)
+DGA_SCENE_ENCODER_BLOCKS = (2, 3, 4, 6, 3)
+DGA_SCENE_ENCODER_STRIDES = (1, 4, 4, 4, 4)
+DGA_SCENE_ENCODER_NSAMPLES = (8, 16, 16, 16, 16)
+DGA_SCENE_ENCODER_SHARE_PLANES = 8
+
+
 def _init_linear(key: jax.Array, in_dim: int, out_dim: int, *, bias: bool = True) -> dict[str, jax.Array]:
     limit = math.sqrt(6.0 / float(in_dim + out_dim))
     weight = jax.random.uniform(key, (in_dim, out_dim), minval=-limit, maxval=limit, dtype=jnp.float32)
@@ -254,11 +261,11 @@ def init_scene_encoder_params(
     point_feature_dim: int,
     context_dim: int,
 ) -> dict[str, object]:
-    planes = [32, 64, 128, 256, int(context_dim)]
-    blocks = [2, 3, 4, 6, 3]
-    strides = [1, 4, 4, 4, 4]
-    nsamples = [8, 16, 16, 16, 16]
-    share_planes = 8
+    planes = DGA_SCENE_ENCODER_PLANES[:-1] + (int(context_dim),)
+    blocks = DGA_SCENE_ENCODER_BLOCKS
+    strides = DGA_SCENE_ENCODER_STRIDES
+    nsamples = DGA_SCENE_ENCODER_NSAMPLES
+    share_planes = DGA_SCENE_ENCODER_SHARE_PLANES
 
     stage_keys = list(jax.random.split(rng_key, len(planes)))
     in_planes = int(point_feature_dim)
@@ -283,8 +290,8 @@ def encode_scene(
     object_points: jax.Array,
     object_normals: jax.Array,
 ) -> jax.Array:
-    strides = (1, 4, 4, 4, 4)
-    nsamples = (8, 16, 16, 16, 16)
+    strides = DGA_SCENE_ENCODER_STRIDES
+    nsamples = DGA_SCENE_ENCODER_NSAMPLES
     features = jnp.concatenate([object_points, object_normals], axis=-1)
     points = object_points
     for stage, stride, nsample in zip(params["stages"], strides, nsamples, strict=True):

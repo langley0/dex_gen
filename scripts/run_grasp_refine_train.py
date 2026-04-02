@@ -43,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-model-separately", action="store_true")
     parser.add_argument("--save-scene-model", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--metrics-path", type=Path, default=None)
+    parser.add_argument("--distributed", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--diffusion-steps", type=int, default=32)
     parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--context-dim", type=int, default=512)
@@ -100,12 +101,15 @@ def main() -> None:
         save_model_separately=bool(args.save_model_separately),
         save_scene_model=bool(args.save_scene_model),
         metrics_path=None if args.metrics_path is None else args.metrics_path.expanduser().resolve(),
+        distributed=bool(args.distributed),
         device=args.device,
         seed=int(args.seed),
     )
 
     result = train_grasp_diffusion(config)
     print(f"architecture       : {result.resolved_model_config.architecture}")
+    print(f"distributed        : {result.distributed}")
+    print(f"device count       : {result.device_count}")
     print(f"pose dim           : {result.resolved_model_config.pose_dim}")
     print(f"epochs             : {len(result.history)}")
     print(f"final step         : {result.final_step}")
