@@ -99,6 +99,7 @@ def dataset_metadata(bundle: MaterializedDgaDataset) -> dict[str, Any]:
             "artifact_paths": [str(path) for path in bundle.config.artifact_paths],
             "artifact_glob": bundle.config.artifact_glob,
             "state_name": bundle.config.state_name,
+            "max_samples_per_artifact": bundle.config.max_samples_per_artifact,
             "object_num_points": int(bundle.config.object_num_points),
             "object_point_seed": int(bundle.config.object_point_seed),
             "coordinate_mode": bundle.config.coordinate_mode,

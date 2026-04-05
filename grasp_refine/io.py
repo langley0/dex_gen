@@ -101,7 +101,13 @@ def load_source_records(config: DatasetConfig) -> list[SourceGraspRecord]:
     records: list[SourceGraspRecord] = []
     for path in resolve_artifact_paths(config):
         payload = load_source_artifact(path, state_name=config.state_name)
-        for record in payload.records:
+        artifact_records = list(payload.records)
+        if config.max_samples_per_artifact is not None:
+            limit = int(config.max_samples_per_artifact)
+            if limit <= 0:
+                raise ValueError("max_samples_per_artifact must be positive when provided.")
+            artifact_records = sorted(artifact_records, key=lambda record: float(record.total_energy))[:limit]
+        for record in artifact_records:
             if config.drop_invalid_samples and not np.all(np.isfinite(record.full_pose)):
                 continue
             records.append(record)

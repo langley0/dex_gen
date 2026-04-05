@@ -29,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--artifact", type=Path, action="append", default=None, help="Input artifact (.npz). Repeatable.")
     parser.add_argument("--artifact-glob", type=str, default=None, help="Optional glob for multiple input artifacts.")
     parser.add_argument("--state", choices=("best", "current"), default="best")
+    parser.add_argument("--max-samples-per-artifact", type=int, default=None, help="Optional top-k samples to keep per artifact by energy.")
     parser.add_argument("--object-num-points", type=int, default=2048)
     parser.add_argument("--object-point-seed", type=int, default=13)
     parser.add_argument("--coordinate-mode", choices=("hand_aligned_object", "world_object_rotated"), default="hand_aligned_object")
@@ -43,6 +44,7 @@ def main() -> None:
         artifact_paths=tuple(path.expanduser().resolve() for path in (args.artifact or [])),
         artifact_glob=args.artifact_glob,
         state_name=args.state,
+        max_samples_per_artifact=None if args.max_samples_per_artifact is None else int(args.max_samples_per_artifact),
         object_num_points=int(args.object_num_points),
         object_point_seed=int(args.object_point_seed),
         coordinate_mode=args.coordinate_mode,

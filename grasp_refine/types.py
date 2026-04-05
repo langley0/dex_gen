@@ -14,6 +14,7 @@ class DatasetConfig:
     artifact_paths: tuple[Path, ...] = ()
     artifact_glob: str | None = None
     state_name: ArtifactStateName = "best"
+    max_samples_per_artifact: int | None = None
     object_num_points: int = 2048
     object_point_seed: int = 13
     coordinate_mode: CoordinateMode = "hand_aligned_object"
