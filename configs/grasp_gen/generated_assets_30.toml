@@ -1,0 +1,140 @@
+[run]
+hand = "right"
+backend = "gpu"
+output_root = "outputs/grasp_gen_generated_30"
+skip_existing = true
+
+[optimizer]
+batch = 8192
+steps = 5000
+points = 10
+contact_count = 4
+seed = 0
+offset = 0.30
+distance_weight = 1.0
+equilibrium_weight = 1.0
+penetration_weight = 100.0
+wrench_iters = 24
+sdf_voxel_size = 0.003
+sdf_padding = 0.01
+bench_steps = 0
+
+[[targets]]
+label = "cube_050"
+asset = "cube_050"
+
+[[targets]]
+label = "cube_058"
+asset = "cube_058"
+
+[[targets]]
+label = "cube_065"
+asset = "cube_065"
+
+[[targets]]
+label = "cube_072"
+asset = "cube_072"
+
+[[targets]]
+label = "cube_078"
+asset = "cube_078"
+
+[[targets]]
+label = "box_060_040_100"
+asset = "box_060_040_100"
+
+[[targets]]
+label = "box_070_050_120"
+asset = "box_070_050_120"
+
+[[targets]]
+label = "box_080_060_090"
+asset = "box_080_060_090"
+
+[[targets]]
+label = "box_050_050_140"
+asset = "box_050_050_140"
+
+[[targets]]
+label = "box_075_035_110"
+asset = "box_075_035_110"
+
+[[targets]]
+label = "box_065_055_085"
+asset = "box_065_055_085"
+
+[[targets]]
+label = "box_045_045_160"
+asset = "box_045_045_160"
+
+[[targets]]
+label = "box_080_040_080"
+asset = "box_080_040_080"
+
+[[targets]]
+label = "cyl_d050_h120"
+asset = "cyl_d050_h120"
+
+[[targets]]
+label = "cyl_d060_h100"
+asset = "cyl_d060_h100"
+
+[[targets]]
+label = "cyl_d070_h140"
+asset = "cyl_d070_h140"
+
+[[targets]]
+label = "cyl_d076_h090"
+asset = "cyl_d076_h090"
+
+[[targets]]
+label = "cyl_d080_h160"
+asset = "cyl_d080_h160"
+
+[[targets]]
+label = "prism5_r034_h110"
+asset = "prism5_r034_h110"
+
+[[targets]]
+label = "prism6_r036_h120"
+asset = "prism6_r036_h120"
+
+[[targets]]
+label = "prism7_r032_h100"
+asset = "prism7_r032_h100"
+
+[[targets]]
+label = "prism8_r038_h090"
+asset = "prism8_r038_h090"
+
+[[targets]]
+label = "prism10_r035_h140"
+asset = "prism10_r035_h140"
+
+[[targets]]
+label = "prism12_r039_h100"
+asset = "prism12_r039_h100"
+
+[[targets]]
+label = "sphere_d060"
+asset = "sphere_d060"
+
+[[targets]]
+label = "sphere_d075"
+asset = "sphere_d075"
+
+[[targets]]
+label = "sphere_d090"
+asset = "sphere_d090"
+
+[[targets]]
+label = "ellipsoid_080_080_050"
+asset = "ellipsoid_080_080_050"
+
+[[targets]]
+label = "ellipsoid_090_070_060"
+asset = "ellipsoid_090_070_060"
+
+[[targets]]
+label = "ellipsoid_100_060_060"
+asset = "ellipsoid_100_060_060"

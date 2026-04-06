@@ -86,14 +86,23 @@ from grasp_gen.grasp_profiler import (
 )
 from grasp_gen.hand import Hand, InitConfig
 from grasp_gen.hand_contacts import ContactConfig
-from grasp_gen.prop_assets import make_named_prop
+from grasp_gen.prop_assets import make_generated_asset_prop, make_named_prop
 
 
 CUBE_SIZE = 0.07
 
 
 def _make_prop(args: argparse.Namespace) -> tuple[Prop, dict[str, object]]:
-    return make_named_prop(args.object, cube_size=float(args.cube_size))
+    if args.asset is not None:
+        return make_generated_asset_prop(args.asset)
+    box_size = None if args.box_size is None else tuple(float(value) for value in args.box_size)
+    return make_named_prop(
+        args.object,
+        cube_size=float(args.cube_size),
+        box_size=box_size,
+        cylinder_radius=float(args.cylinder_radius),
+        cylinder_half_height=float(args.cylinder_half_height),
+    )
 
 
 def _default_output_path(batch: int, steps: int, seed: int, object_kind: str) -> Path:
@@ -134,8 +143,29 @@ def parse_args() -> argparse.Namespace:
         help="JAX backend to request. 'gpu' is normalized to JAX's 'cuda'. Defaults to automatic selection.",
     )
     parser.add_argument("--hand", choices=("right", "left"), default="right")
-    parser.add_argument("--object", choices=("cylinder", "cube", "drill", "decor01"), default="cylinder")
+    parser.add_argument("--asset", type=str, default=None, help="Generated asset name under assets/generated/<asset>/asset.json.")
+    parser.add_argument("--object", choices=("cylinder", "cube", "box", "drill", "decor01"), default="cylinder")
     parser.add_argument("--cube-size", type=float, default=CUBE_SIZE, help="Cube edge length when --object cube.")
+    parser.add_argument(
+        "--box-size",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("SIZE_X", "SIZE_Y", "SIZE_Z"),
+        help="Box side lengths when --object box.",
+    )
+    parser.add_argument(
+        "--cylinder-radius",
+        type=float,
+        default=0.045,
+        help="Cylinder radius when --object cylinder.",
+    )
+    parser.add_argument(
+        "--cylinder-half-height",
+        type=float,
+        default=0.165,
+        help="Cylinder half height when --object cylinder.",
+    )
     parser.add_argument("--batch", "--envs", dest="batch", type=int, default=64, help="Number of optimizer environments.")
     parser.add_argument("--steps", type=int, default=5000, help="Number of optimizer steps to run.")
     parser.add_argument("--points", type=int, default=10, help="Sampled contact points per segment.")
@@ -153,12 +183,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def validate_args(args: argparse.Namespace) -> None:
     if args.batch <= 0:
         raise SystemExit("--batch must be positive.")
     if args.cube_size <= 0.0:
         raise SystemExit("--cube-size must be positive.")
+    if args.object == "box":
+        if args.box_size is None:
+            raise SystemExit("--box-size must be provided when --object box.")
+        if any(size <= 0.0 for size in args.box_size):
+            raise SystemExit("--box-size entries must be positive.")
+    if args.cylinder_radius <= 0.0:
+        raise SystemExit("--cylinder-radius must be positive.")
+    if args.cylinder_half_height <= 0.0:
+        raise SystemExit("--cylinder-half-height must be positive.")
     if args.steps < 0:
         raise SystemExit("--steps must be non-negative.")
     if args.points <= 0:
@@ -180,8 +218,10 @@ def main() -> None:
     if args.sdf_padding < 0.0:
         raise SystemExit("--sdf-padding must be non-negative.")
 
+
+def run_optimizer(args: argparse.Namespace) -> Path:
     output_path = (
-        _default_output_path(args.batch, args.steps, args.seed, args.object)
+        _default_output_path(args.batch, args.steps, args.seed, args.asset if args.asset is not None else args.object)
         if args.output is None
         else args.output.resolve()
     )
@@ -301,7 +341,7 @@ def main() -> None:
     if hasattr(energy_model, "effective_penetration_weight"):
         print(f"effective pen wt : {energy_model.effective_penetration_weight:.6f}")
     print(f"cloud scale      : {init_cfg.contact_cloud_scale:.5f}")
-    print(f"object kind      : {args.object}")
+    print(f"object kind      : {args.asset if args.asset is not None else args.object}")
     print("equilibrium mode : wrench")
     print(f"best energy mean : {result_stats['best_energy_mean']:.6f}")
     print(f"best energy min  : {result_stats['best_energy_min']:.6f}")
@@ -321,6 +361,13 @@ def main() -> None:
         print(f"bottleneck       : {name} ({float(stats['total_s']):.3f}s total)")
     print("profile summary  :")
     print(format_profile_summary(profile_summary))
+    return output_path
+
+
+def main() -> None:
+    args = parse_args()
+    validate_args(args)
+    run_optimizer(args)
 
 
 if __name__ == "__main__":

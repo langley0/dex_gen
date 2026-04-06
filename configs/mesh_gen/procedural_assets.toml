@@ -1,0 +1,181 @@
+[output]
+asset_root = "assets/generated"
+
+[[assets]]
+name = "cube_050"
+primitive = "box"
+size_xyz = [0.05, 0.05, 0.05]
+
+[[assets]]
+name = "cube_058"
+primitive = "box"
+size_xyz = [0.058, 0.058, 0.058]
+
+[[assets]]
+name = "cube_065"
+primitive = "box"
+size_xyz = [0.065, 0.065, 0.065]
+
+[[assets]]
+name = "cube_072"
+primitive = "box"
+size_xyz = [0.072, 0.072, 0.072]
+
+[[assets]]
+name = "cube_078"
+primitive = "box"
+size_xyz = [0.078, 0.078, 0.078]
+
+[[assets]]
+name = "box_060_040_100"
+primitive = "box"
+size_xyz = [0.06, 0.04, 0.10]
+
+[[assets]]
+name = "box_070_050_120"
+primitive = "box"
+size_xyz = [0.07, 0.05, 0.12]
+
+[[assets]]
+name = "box_080_060_090"
+primitive = "box"
+size_xyz = [0.08, 0.06, 0.09]
+
+[[assets]]
+name = "box_050_050_140"
+primitive = "box"
+size_xyz = [0.05, 0.05, 0.14]
+
+[[assets]]
+name = "box_075_035_110"
+primitive = "box"
+size_xyz = [0.075, 0.035, 0.11]
+
+[[assets]]
+name = "box_065_055_085"
+primitive = "box"
+size_xyz = [0.065, 0.055, 0.085]
+
+[[assets]]
+name = "box_045_045_160"
+primitive = "box"
+size_xyz = [0.045, 0.045, 0.16]
+
+[[assets]]
+name = "box_080_040_080"
+primitive = "box"
+size_xyz = [0.08, 0.04, 0.08]
+
+[[assets]]
+name = "cyl_d050_h120"
+primitive = "cylinder"
+radius = 0.025
+half_height = 0.06
+
+[[assets]]
+name = "cyl_d060_h100"
+primitive = "cylinder"
+radius = 0.03
+half_height = 0.05
+
+[[assets]]
+name = "cyl_d070_h140"
+primitive = "cylinder"
+radius = 0.035
+half_height = 0.07
+
+[[assets]]
+name = "cyl_d076_h090"
+primitive = "cylinder"
+radius = 0.038
+half_height = 0.045
+
+[[assets]]
+name = "cyl_d080_h160"
+primitive = "cylinder"
+radius = 0.04
+half_height = 0.08
+
+[[assets]]
+name = "prism5_r034_h110"
+primitive = "prism"
+radius = 0.034
+half_height = 0.055
+sides = 5
+
+[[assets]]
+name = "prism6_r036_h120"
+primitive = "prism"
+radius = 0.036
+half_height = 0.06
+sides = 6
+
+[[assets]]
+name = "prism7_r032_h100"
+primitive = "prism"
+radius = 0.032
+half_height = 0.05
+sides = 7
+
+[[assets]]
+name = "prism8_r038_h090"
+primitive = "prism"
+radius = 0.038
+half_height = 0.045
+sides = 8
+
+[[assets]]
+name = "prism10_r035_h140"
+primitive = "prism"
+radius = 0.035
+half_height = 0.07
+sides = 10
+
+[[assets]]
+name = "prism12_r039_h100"
+primitive = "prism"
+radius = 0.039
+half_height = 0.05
+sides = 12
+
+[[assets]]
+name = "sphere_d060"
+primitive = "ellipsoid"
+radii_xyz = [0.03, 0.03, 0.03]
+latitude_segments = 16
+longitude_segments = 24
+
+[[assets]]
+name = "sphere_d075"
+primitive = "ellipsoid"
+radii_xyz = [0.0375, 0.0375, 0.0375]
+latitude_segments = 16
+longitude_segments = 24
+
+[[assets]]
+name = "sphere_d090"
+primitive = "ellipsoid"
+radii_xyz = [0.045, 0.045, 0.045]
+latitude_segments = 16
+longitude_segments = 24
+
+[[assets]]
+name = "ellipsoid_080_080_050"
+primitive = "ellipsoid"
+radii_xyz = [0.04, 0.04, 0.025]
+latitude_segments = 16
+longitude_segments = 24
+
+[[assets]]
+name = "ellipsoid_090_070_060"
+primitive = "ellipsoid"
+radii_xyz = [0.045, 0.035, 0.03]
+latitude_segments = 16
+longitude_segments = 24
+
+[[assets]]
+name = "ellipsoid_100_060_060"
+primitive = "ellipsoid"
+radii_xyz = [0.05, 0.03, 0.03]
+latitude_segments = 16
+longitude_segments = 24
